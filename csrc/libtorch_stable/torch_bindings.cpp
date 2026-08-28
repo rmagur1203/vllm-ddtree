@@ -7,7 +7,24 @@
 // Register ops with STABLE_TORCH_LIBRARY for libtorch stable ABI compatibility.
 // Note: We register under namespace "_C" so ops are accessible as
 // torch.ops._C.<op_name> for compatibility with existing code.
+void ddtree_gdn_decode_tree_mtp(
+    torch::stable::Tensor& mixed_qkv, torch::stable::Tensor& a,
+    torch::stable::Tensor& b, torch::stable::Tensor& A_log,
+    torch::stable::Tensor& dt_bias, torch::stable::Tensor& state_indices,
+    torch::stable::Tensor& cu_seqlens,
+    torch::stable::Tensor& num_accepted_tokens,
+    torch::stable::Tensor& tree_parents, torch::stable::Tensor& state,
+    torch::stable::Tensor& output_gate, torch::stable::Tensor& norm_weight,
+    torch::stable::Tensor& out, double scale, double norm_eps);
+
 STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
+  // DDTree: 트리 부모를 받는 GDN 융합 디코드 (원본의 8토큰 상한 없음).
+  ops.def(
+      "ddtree_gdn_decode_tree_mtp(Tensor mixed_qkv, Tensor a, Tensor b, "
+      "Tensor A_log, Tensor dt_bias, Tensor state_indices, Tensor cu_seqlens, "
+      "Tensor num_accepted_tokens, Tensor tree_parents, Tensor! state, "
+      "Tensor output_gate, Tensor norm_weight, Tensor! out, float scale, "
+      "float norm_eps) -> ()");
   // Compute per-token-group FP8 quantized tensor and scaling factor.
   // The dummy arguments are here so we can correctly fuse with RMSNorm.
   ops.def(
@@ -708,6 +725,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+  // DDTree GDN 트리 커널
+  ops.impl("ddtree_gdn_decode_tree_mtp", TORCH_BOX(&ddtree_gdn_decode_tree_mtp));
   // LongCat n-gram embedding index kernel.
   ops.impl("ngram_compute_n_gram_ids", TORCH_BOX(&ngram_compute_n_gram_ids));
 
