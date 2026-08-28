@@ -9,5 +9,7 @@
 
 from vllm.v1.spec_decode.ddtree.tree import (Tree, build_tree, build_tree_from_logits,
                                        flat_tree_mask, follow_tree)
+from vllm.v1.spec_decode.ddtree.compact import (attention_caches, compact_kv_torch,
+                                          compact_kv_triton)
 
-__all__ = ["Tree", "build_tree", "build_tree_from_logits", "flat_tree_mask", "follow_tree"]
+__all__ = ["Tree", "attention_caches", "build_tree", "build_tree_from_logits", "compact_kv_torch", "compact_kv_triton", "flat_tree_mask", "follow_tree"]
