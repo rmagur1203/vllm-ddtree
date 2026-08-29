@@ -98,6 +98,21 @@ logger = init_logger(__name__)
 _DDTREE_GDN_PROVIDER = None
 
 
+_DDTREE_KERNEL_READY = None
+
+
+def _ddtree_kernel_ready() -> bool:
+    """우리 GDN 트리 커널을 실제로 쓸 수 있는지 (한 번만 확인해 캐시)."""
+    global _DDTREE_KERNEL_READY
+    if _DDTREE_KERNEL_READY is None:
+        try:
+            from vllm.v1.spec_decode.ddtree.cuda_ext import get_ext
+            _DDTREE_KERNEL_READY = get_ext() is not None
+        except Exception:
+            _DDTREE_KERNEL_READY = False
+    return _DDTREE_KERNEL_READY
+
+
 def set_ddtree_gdn_provider(fn) -> None:
     """fn(n_spec_reqs, T) -> {"parents","keys","tree_cols"} | None"""
     global _DDTREE_GDN_PROVIDER
@@ -1908,9 +1923,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # 🔴 DDTree: 우리 커널은 8토큰 상한이 없다 (공유메모리에서 shared_state 를
             #    제거하고 토큰 축을 타일링했다). 트리 공급자가 등록돼 있으면 상한을 푼다.
             #    원본 커널은 여전히 8 초과를 거부하므로, 트리가 아닐 때는 그대로 둔다.
+            # 🔴 상한을 푸는 조건은 "프로바이더 등록" 이 아니라 "우리 커널을 실제로
+            #    쓸 수 있는가" 다. 커널이 없으면 원본으로 떨어지는데 원본은 8토큰
+            #    상한이 있어 죽는다 (state_indices must have shape [N,S] S<=8).
+            #    커널이 없으면 융합 경로를 아예 쓰지 않고 Triton 으로 간다.
             and (
                 state_indices.size(1) <= MAX_FUSED_GDN_MTP_TOKENS
-                or _DDTREE_GDN_PROVIDER is not None
+                or (_DDTREE_GDN_PROVIDER is not None and _ddtree_kernel_ready())
             )
             and hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp")
         )
