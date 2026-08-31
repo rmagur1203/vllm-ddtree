@@ -98,7 +98,9 @@ class DDTreeRuntime:
                   "a_loop": 0.0, "a_out": 0.0,
                   # propose 내부 — p_topk 는 D2H 를 포함하므로 드래프터 forward
                   # 대기가 섞인다. p_wait 로 떼려면 time_split 을 켠다.
-                  "p_wait": 0.0, "p_topk": 0.0, "p_build": 0.0, "p_out": 0.0}
+                  "p_wait": 0.0, "p_topk": 0.0, "p_build": 0.0, "p_out": 0.0,
+                  # kv_compact 내부
+                  "c_idx": 0.0, "c_viol": 0.0, "c_kernel": 0.0}
         global LAST
         LAST = self
 
@@ -571,42 +573,66 @@ class DDTreeRuntime:
         #    인덱스를 GPU 에서 만들고, 항등 복사(i == a)는 걸러내지 않는다 —
         #    커널이 같은 값을 같은 자리에 쓰는 것뿐이라 무해하고, 거르려면 동기화가 필요하다.
         dev = self.device
+        _tc = time.perf_counter()
+        # 🔴 수용 경로 인덱스는 캐시 그룹과 무관하다. 예전에는 그룹 루프 안에서
+        #    요청마다 as_tensor/arange 를 다시 만들어 (그룹 x 요청) 번 H2D 가 났다.
+        #    하이브리드는 그룹이 3개라 그대로 3배였다. 한 번만 만든다.
+        n = 0
+        seg = [0]
+        a_flat, i_flat = [], []
+        for idx, acc in paths.items():
+            base = int(self.q_start[idx])
+            a_flat.extend(base + a for a in acc)
+            i_flat.extend(range(base, base + len(acc)))
+            n += len(acc)
+            seg.append(n)
+        if n == 0:
+            self.t["c_idx"] += time.perf_counter() - _tc
+            return
+        # H2D 는 여기 세 번뿐이다 (인덱스 2 + 세그먼트 1).
+        a_idx = torch.as_tensor(a_flat, dtype=torch.long, device=dev)
+        i_idx = torch.as_tensor(i_flat, dtype=torch.long, device=dev)
+        seg_t = torch.tensor(seg, dtype=torch.int32, device=dev)
+
+        # 그룹별 src/dst 를 먼저 다 만들고, 안전성 검사는 **한 번에** 동기화한다.
+        plans = []
         for slot_mapping, block_size in self.groups:
             caches = self._attn_caches(kv_caches, block_size)
             if not caches:
                 continue
-            src_parts, dst_parts, seg, n = [], [], [0], 0
-            for idx, acc in paths.items():
-                base = int(self.q_start[idx])
-                a_t = torch.as_tensor(acc, dtype=torch.long, device=dev)
-                i_t = torch.arange(len(acc), dtype=torch.long, device=dev)
-                src_parts.append(slot_mapping[base + a_t])
-                dst_parts.append(slot_mapping[base + i_t])
-                n += len(acc)
-                seg.append(n)
-            if n == 0:
-                continue
+            plans.append((caches, block_size,
+                          slot_mapping[a_idx], slot_mapping[i_idx]))
+        self.t["c_idx"] += time.perf_counter() - _tc
+        if not plans:
+            return
+
+        # 🔴 compact_kv_triton 은 세그먼트 안에서 순차로 돌면서 dst[i] <= src[i]
+        #    (둘 다 증가) 를 전제로 한다. a[i] >= i 는 항상 참이지만, 그게 슬롯으로
+        #    옮겨가려면 slot_mapping 이 이 구간에서 단조 증가여야 한다. 토큰이 KV 블록
+        #    경계를 넘으면 다음 블록 id 가 더 작을 수 있어(블록은 free pool 에서 나온다)
+        #    전제가 깨지고, 나중 쓰기가 앞선 읽기의 원본을 덮는다.
+        #
+        # 🔴 예전에는 이 검사를 그룹마다 .item() 으로 불러 스텝당 그룹 수만큼
+        #    파이프라인이 섰다. 전부 쌓아 한 번만 내린다.
+        _tv = time.perf_counter()
+        _viols = torch.stack([(d > s_).sum() for _, _, s_, d in plans]).tolist()
+        self.t["c_viol"] += time.perf_counter() - _tv
+
+        for (caches, block_size, _src, _dst), _viol in zip(plans, _viols):
+            _viol = int(_viol)
             self.stats["kv_groups"] += 1
             self.stats["kv_rows"] += n
-            _src = torch.cat(src_parts)
-            _dst = torch.cat(dst_parts)
-            # 🔴 compact_kv_triton 은 세그먼트 안에서 순차로 돌면서 dst[i] <= src[i]
-            #    (둘 다 증가) 를 전제로 한다. a[i] >= i 는 항상 참이지만, 그게 슬롯으로
-            #    옮겨가려면 slot_mapping 이 이 구간에서 단조 증가여야 한다. 토큰이 KV 블록
-            #    경계를 넘으면 다음 블록 id 가 더 작을 수 있어(블록은 free pool 에서 나온다)
-            #    전제가 깨지고, 나중 쓰기가 앞선 읽기의 원본을 덮는다.
-            _viol = int((_dst > _src).sum().item())
             if _viol:
                 self.stats["compact_unsafe"] += _viol
+            _tk = time.perf_counter()
             if _viol or self.compact_impl == "torch":
                 # gather 후 scatter — 순서 전제가 없다
-                compact_mod.compact_kv_torch(
-                    caches, _src, _dst,
-                    torch.tensor(seg, dtype=torch.int32, device=dev), block_size,
-                )
+                compact_mod.compact_kv_torch(caches, _src, _dst, seg_t,
+                                             block_size)
             else:
                 compact_mod.compact_kv_triton(
                     caches, _src.to(torch.int32), _dst.to(torch.int32),
-                    torch.tensor(seg, dtype=torch.int32, device=dev), block_size,
+                    seg_t, block_size,
                 )
+            self.t["c_kernel"] += time.perf_counter() - _tk
         self.t["kv_compact"] += time.perf_counter() - _t0
