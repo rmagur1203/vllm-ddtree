@@ -50,6 +50,32 @@ def tree_cols_tensor(trees, width: int, device) -> torch.Tensor:
 
 
 _LAYERS: dict = {}   # layer_id -> (conv_state, ssm_state, slots, width, keys)
+
+# 스텝 안에서 계층끼리 공유하는 D2H 결과.
+#
+# 🔴 GDN 계층 24개가 각각 state_indices 를 .tolist() 하면 스텝당 24회 동기화가
+#    되는데, 내용은 계층마다 **동일하다** (같은 스텝의 같은 메타데이터).
+#    한 번만 내리고 나눠 쓴다.
+_STEP_MEMO: dict = {}
+
+
+def new_step() -> None:
+    """스텝 경계. 계층 간 공유 캐시를 비운다.
+
+    🔴 반드시 스텝마다 불러야 한다. data_ptr 를 키에 쓰므로, 안 비우면 해제된
+       버퍼 주소가 재사용됐을 때 지난 스텝 값을 돌려줄 수 있다.
+    """
+    _STEP_MEMO.clear()
+
+
+def tolist_cached(tag: str, t) -> list:
+    """스텝 안에서 같은 텐서의 .tolist() 를 한 번으로 묶는다."""
+    key = (tag, t.data_ptr(), tuple(t.shape), t.dtype)
+    v = _STEP_MEMO.get(key)
+    if v is None:
+        v = t.tolist()
+        _STEP_MEMO[key] = v
+    return v
 COMPACT_STATS = {"layers": 0, "reqs": 0, "ssm_copies": 0, "conv_moves": 0}
 
 

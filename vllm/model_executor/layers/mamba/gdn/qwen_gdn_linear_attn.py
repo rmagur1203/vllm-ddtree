@@ -1374,11 +1374,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             _info = _ddtree_gdn(_n_spec, _T, conv_weights.shape[-1])
             self._ddtree_info = _info
             if _info is not None:
-                from vllm.v1.spec_decode.ddtree.gdn import register_state
+                from vllm.v1.spec_decode.ddtree.gdn import (register_state,
+                                                            tolist_cached)
 
+                # 🔴 계층마다 내리면 스텝당 24회 D2H 다. 내용은 계층 간 동일하다.
                 register_state(
                     id(self), conv_state, ssm_state,
-                    spec_state_indices_tensor[:_n_spec].tolist(),
+                    tolist_cached("ssi", spec_state_indices_tensor[:_n_spec]),
                     conv_weights.shape[-1], _info["keys"],
                 )
             mixed_qkv_spec = causal_conv1d_update(
@@ -1774,11 +1776,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         _info = _ddtree_gdn(num_requests, _T, conv_weights.shape[-1])
         self._ddtree_info = _info
         if _info is not None:
-            from vllm.v1.spec_decode.ddtree.gdn import register_state
+            from vllm.v1.spec_decode.ddtree.gdn import (register_state,
+                                                        tolist_cached)
 
+            # 🔴 계층마다 내리면 스텝당 24회 D2H 다. 내용은 계층 간 동일하다.
             register_state(
                 id(self), conv_state, self.kv_cache[1],
-                state_indices[:num_requests].tolist(),
+                tolist_cached("si", state_indices[:num_requests]),
                 conv_weights.shape[-1], _info["keys"],
             )
         # --- DDTree 진단: conv 상태를 스텝 경계로 덤프한다 (VLLM_DDTREE_CONVDUMP=N) ---

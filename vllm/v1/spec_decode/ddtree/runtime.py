@@ -254,6 +254,9 @@ class DDTreeRuntime:
     # ------------------------------------------------------------------ 2
     def begin_step(self, req_ids, num_reqs, scheduled_spec_tokens,
                    num_computed_tokens, query_start_loc_np):
+        # GDN 계층들이 스텝 안에서 공유하는 D2H 캐시를 비운다 (gdn.tolist_cached)
+        from vllm.v1.spec_decode.ddtree import gdn as _gdn_mod
+        _gdn_mod.new_step()
         self.step = []
         self.step_req_ids = []
         self.num_reqs = num_reqs
