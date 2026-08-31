@@ -1791,6 +1791,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self, conv_state, mixed_qkv[:num_actual_tokens], state_indices,
             num_accepted_tokens, num_requests,
             None if _info is None else _info["tree_cols"])
+        if _info is not None:
+            from vllm.v1.spec_decode.ddtree.gdn import validate_tree_inputs
+            validate_tree_inputs(
+                parents=_info["parents"], cu_seqlens=cu_seqlens,
+                state_indices=state_indices, tree_cols=_info.get("tree_cols"),
+                conv_state=conv_state, n_reqs=num_requests, tag="융합 conv")
         mixed_qkv = causal_conv1d_update(
             mixed_qkv[:num_actual_tokens],
             conv_state,
@@ -1859,6 +1865,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     # 🔴 상태 캐시 전체는 GB 단위다 — 이번 스텝이 건드리는 슬롯만 복제한다
                     _slots = state_indices[:num_requests].reshape(-1).unique()
                     _snap = self.kv_cache[1][_slots].clone()
+                from vllm.v1.spec_decode.ddtree.gdn import validate_tree_inputs
+                validate_tree_inputs(
+                    parents=_info["parents"], cu_seqlens=cu_seqlens,
+                    state_indices=state_indices, ssm_state=self.kv_cache[1],
+                    n_reqs=num_requests, tag="융합 SSM")
                 _ext.gdn_decode_tree_mtp(
                     mixed_qkv, a, b, self.A_log, self.dt_bias,
                     state_indices[:num_requests].contiguous(),

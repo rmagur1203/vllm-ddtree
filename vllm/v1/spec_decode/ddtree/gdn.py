@@ -49,6 +49,59 @@ def tree_cols_tensor(trees, width: int, device) -> torch.Tensor:
     return torch.from_numpy(np.stack(rows).astype(np.int32)).to(device)
 
 
+def validate_tree_inputs(*, parents, cu_seqlens, state_indices, tree_cols=None,
+                         conv_state=None, ssm_state=None, n_reqs, tag=""):
+    """커널 실행 전에 인덱스 불변식을 호스트에서 검사한다.
+
+    device-side assert 는 어느 텐서의 어느 값이 문제인지 알려주지 않는다.
+    VLLM_DDTREE_VALIDATE=1 일 때만 동작한다 (D2H 동기화가 있어 느리다).
+    """
+    import os
+    if os.environ.get("VLLM_DDTREE_VALIDATE") != "1":
+        return
+
+    def fail(msg):
+        raise AssertionError(f"[DDTree 검증 실패{(' ' + tag) if tag else ''}] {msg}")
+
+    cl = cu_seqlens[: n_reqs + 1].tolist()
+    lens = [cl[i + 1] - cl[i] for i in range(n_reqs)]
+    if any(L < 0 for L in lens):
+        fail(f"cu_seqlens 가 감소한다: {cl}")
+    par = parents.tolist()
+    if len(par) != n_reqs:
+        fail(f"parents 행 {len(par)} != 요청 {n_reqs}  lens={lens}")
+    siw = state_indices.shape[1]
+    for r in range(n_reqs):
+        L = lens[r]
+        if L > siw:
+            fail(f"req{r}: 토큰 {L} > state_indices 폭 {siw}")
+        if L > len(par[r]):
+            fail(f"req{r}: 토큰 {L} > parents 폭 {len(par[r])}")
+        for t in range(L):
+            pv = par[r][t]
+            if pv < -1 or pv >= t:
+                fail(f"req{r} node{t}: 부모 {pv} 가 [-1,{t}) 밖  lens={lens}")
+    if tree_cols is not None and conv_state is not None:
+        cols = tree_cols.tolist()
+        state_len = conv_state.shape[-1]
+        if len(cols) != n_reqs:
+            fail(f"tree_cols 행 {len(cols)} != 요청 {n_reqs}")
+        for r in range(n_reqs):
+            if lens[r] > len(cols[r]):
+                fail(f"req{r}: 토큰 {lens[r]} > tree_cols 폭 {len(cols[r])}")
+            for t in range(lens[r]):
+                for c in cols[r][t]:
+                    if c < 0 or c >= state_len:
+                        fail(f"req{r} node{t}: conv 열 {c} 가 [0,{state_len}) 밖")
+    if ssm_state is not None:
+        nslot = ssm_state.shape[0]
+        for r in range(n_reqs):
+            for t in range(lens[r]):
+                v = int(state_indices[r][t])
+                if v < 0 or v >= nslot:
+                    fail(f"req{r} node{t}: 슬롯 {v} 가 [0,{nslot}) 밖")
+
+
 _LAYERS: dict = {}   # layer_id -> (conv_state, ssm_state, slots, width, keys)
 
 # 스텝 안에서 계층끼리 공유하는 D2H 결과.
