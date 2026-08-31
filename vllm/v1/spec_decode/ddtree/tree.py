@@ -144,7 +144,7 @@ def build_tree(
 # 실측 (요청 64, vocab 151936, 깊이 15, A6000): 결과는 상한과 무관하게 동일하고
 # 속도-메모리만 맞바꾼다.
 #     16 MiB  15.67 ms  최대할당  310 MiB
-#     64 MiB  12.34 ms  최대할당  406 MiB   <- 기본값
+#     64 MiB  12.34 ms  최대할당  406 MiB   ← 기본값
 #    256 MiB  11.47 ms  최대할당  790 MiB
 #   무제한     11.13 ms  최대할당 1391 MiB
 # 배치가 큰 상황은 곧 메모리가 빠듯한 상황이라 안전 쪽을 기본으로 둔다.
@@ -166,7 +166,7 @@ def topk_from_logits(draft_logits: torch.Tensor, budget: int,
     선행 차원은 그대로 유지하므로 [depth, vocab] 도 [요청, depth, vocab] 도 받는다.
 
     🔴 **D2H 는 호출당 정확히 2회다.** 예전에는 요청마다 build_tree_from_logits
-       를 불러 2n회 났는데, 각 복사가 앞선 GPU 작업이 끝날 때까지 파이프라인을
+       를 불러 2n회 났는데, 각 복사가 드래프터 GPU 작업이 끝날 때까지 파이프라인을
        세우므로 배치 크기에 비례해 비용이 붙었다.
     """
     vocab = draft_logits.shape[-1]

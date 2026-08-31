@@ -48,12 +48,8 @@ class DDTreeRuntime:
         # 확신 시 예산 전부를 깊이에 쏟는다. 트리가 예산보다 짧아질 수 있어
         # 스텝의 드래프트 폭이 줄어든다 — 요청이 하나일 때만 켠다(아래 참조).
         self.true_chain = _os.environ.get("VLLM_DDTREE_TRUECHAIN") == "1"
-        # 계측 전용. 구간 앞에서 한 번 동기화해 '앞선 GPU 작업 대기'와 '우리 CPU
-        # 작업'을 분리한다. 켜면 파이프라인이 서므로 성능 측정에는 쓰지 않는다.
-        #
-        # 🔴 이게 없으면 구간 시간을 통째로 오독한다. .tolist()/.item() 은 앞서
-        #    큐에 든 GPU 작업이 끝날 때까지 CPU 를 세우므로, 그 대기가 우리
-        #    비용으로 잡힌다 (실측: accept 1.87 ms 중 1.66 ms 가 타깃 forward 대기).
+        # 계측 전용: topk 앞에서 한 번 동기화해 '드래프터 대기'와 'topk 비용'을
+        # 분리한다. 켜면 파이프라인이 서므로 성능 측정에는 쓰지 않는다.
         self.time_split = _os.environ.get("VLLM_DDTREE_TIMESPLIT") == "1"
         self.trace_n = int(_os.environ.get("VLLM_DDTREE_TRACE", "0"))
         self.trace: list = []
@@ -74,6 +70,9 @@ class DDTreeRuntime:
         self._attn_cache_memo: dict = {}
         self.masked_trees: set[int] = set()
         self.step_req_ids: list = []
+        # 요청별 드래프트 길이. 텐서는 최대 폭으로 패딩되므로, 스케줄러에
+        # 넘길 때 각 행을 이 길이로 잘라야 요청마다 다른 길이가 성립한다.
+        self.draft_lens: dict = {}
         self.prev_paths: dict = {}   # req_id -> 직전 스텝 수용 경로
         import os as _os
         self.debug = _os.environ.get("VLLM_DDTREE_DEBUG")
@@ -86,6 +85,8 @@ class DDTreeRuntime:
                       "gdn_par_none": 0, "gdn_last": None,
                       "gdn_cmp": None, "kv_groups": 0, "kv_rows": 0,
                       "tree_underfilled": 0, "compact_unsafe": 0,
+                      # 요청별 드래프트 길이 분포 — 갈리는지 확인용
+                      "len_hist": {},
                       # 평균만 보면 꼬리가 안 보인다 — 분포를 직접 센다
                       "acc_hist": [0] * 65, "depth_hist": [0] * 65,
                       # 동적 선택이 옳았는지 — 모드별 수용/스텝수
@@ -93,13 +94,13 @@ class DDTreeRuntime:
         # 구간별 누적 시간(초) — 병목을 숫자로 본다
         self.t = {"propose": 0.0, "mask": 0.0, "accept": 0.0,
                   "kv_compact": 0.0, "gdn_compact": 0.0, "rope": 0.0,
-                  # accept 내부 — 대기와 실제 작업을 가른다 (time_split 참고)
+                  # propose 내부 쪼개기 — 어디가 병목인지 숫자로 본다.
+                  # 🔴 p_topk 는 D2H 를 포함하므로 앞선 GPU 작업(드래프터
+                  #    forward)이 안 끝났으면 그 대기가 통째로 들어온다.
+                  #    VLLM_DDTREE_TIMESPLIT=1 이면 그 대기를 p_wait 로 뗀다.
+                  "p_topk": 0.0, "p_build": 0.0, "p_out": 0.0, "p_wait": 0.0,
                   "a_wait": 0.0, "a_meta": 0.0, "a_argmax": 0.0,
                   "a_loop": 0.0, "a_out": 0.0,
-                  # propose 내부 — p_topk 는 D2H 를 포함하므로 드래프터 forward
-                  # 대기가 섞인다. p_wait 로 떼려면 time_split 을 켠다.
-                  "p_wait": 0.0, "p_topk": 0.0, "p_build": 0.0, "p_out": 0.0,
-                  # kv_compact 내부
                   "c_idx": 0.0, "c_viol": 0.0, "c_kernel": 0.0}
         global LAST
         LAST = self
@@ -118,7 +119,9 @@ class DDTreeRuntime:
                 continue
             # 🔴 예전에는 build_tree 를 직접 불러 spine/depth_bonus/dynamic_tau
             #    손잡이가 전부 무시됐다. DFlash 경로와 같은 모양 결정을 쓴다.
-            _short = self.true_chain and self.dynamic_tau is not None and len(req_ids) == 1
+            # ngram 경로는 list[list[int]] 을 돌려주므로 요청마다 길이가 달라도
+            # 된다 — 단일 요청 제약이 필요 없다.
+            _short = self.true_chain and self.dynamic_tau is not None
             tree = shape_and_build(
                 lp, ids, self.budget, topk=self.topk_cap, spine=self.spine,
                 depth_bonus=self.depth_bonus, dynamic_tau=self.dynamic_tau,
@@ -132,6 +135,7 @@ class DDTreeRuntime:
                 out.append([])
                 continue
             self.pending[req_id] = tree
+            self.stats["len_hist"][_n] = self.stats["len_hist"].get(_n, 0) + 1
             out.append([int(t) for t in tree.token_ids])
         return out
 
@@ -149,19 +153,19 @@ class DDTreeRuntime:
            유지한다 (gpu_model_runner.py:1979 의 isinstance 단언,
            :1989 의 flatten() 인덱싱, :5055 의 shape[1]).
 
+        🔴 요청마다 topk 결과를 CPU 로 내리므로 배치가 크면 동기화 비용이 크다.
+           성능 측정(M5) 전에 배치 topk + 단일 D2H 로 바꿔야 한다.
         """
         vocab = logits.shape[-1]
         lg = logits.view(-1, drafter_k, vocab)
         n = len(req_ids)
-        # 🔴 짧은 드래프트는 요청이 하나일 때만 허용한다. 한 스텝의 드래프트 폭은
-        #    텐서 하나로 모든 요청이 공유하므로, 요청마다 트리 크기가 다르면
-        #    짧은 쪽을 늘려야 하고 그러면 모양이 뒤틀린다.
-        _short_ok = self.true_chain and self.dynamic_tau is not None and n == 1
+        # 텐서는 최대 크기로 패딩하고, 요청별 실제 길이는 self.draft_lens 로
+        # 따로 넘긴다 (gpu_model_runner 가 CPU 복사 후 행을 잘라준다).
+        _short_ok = self.true_chain and self.dynamic_tau is not None
 
         # 🔴 배치 전체를 한 번에 topk 한다. 예전에는 요청마다
-        #    build_tree_from_logits 를 불러 D2H 가 2n회 났고, 복사마다 앞선 GPU
-        #    작업(드래프터 forward)을 기다리느라 파이프라인이 섰다. 이제 2회다.
-        #    실측(vocab 151936, 깊이 15, 예산 16): 요청 64에서 24.49 -> 14.96 ms.
+        #    build_tree_from_logits 를 불러 D2H 가 2n회 났고, 복사마다 드래프터
+        #    GPU 작업을 기다리느라 파이프라인이 섰다. 이제 스텝당 2회다.
         if self.time_split:
             _tw = time.perf_counter()
             torch.cuda.synchronize()
@@ -194,22 +198,25 @@ class DDTreeRuntime:
         width = max((t.num_nodes - 1 for t in trees.values()), default=self.budget)
         width = max(1, min(width, self.budget))
         out = np.zeros((n, width), dtype=np.int64)
+        self.draft_lens = {}
         for i, req_id in enumerate(req_ids):
             tree = trees.get(i)
             if tree is None:
                 continue
-            if tree.num_nodes - 1 != width:
-                # 이 스텝의 드래프트 폭과 트리 크기가 어긋나면 GDN 계층이 트리
-                # 정보를 못 받고 8토큰 상한이 있는 원본 커널로 떨어져 죽는다.
-                # 요청이 여럿이고 크기가 다를 때만 발생한다 (단일 요청이면 width
-                # 가 곧 그 트리의 크기다).
+            _n = tree.num_nodes - 1
+            if _n > width or _n < 1:
+                # width 는 이 스텝 트리들의 최대 크기이므로 여기 오면 안 된다.
                 self.stats["tree_underfilled"] += 1
                 self.pending.pop(req_id, None)
                 continue
+            self.draft_lens[i] = _n
+            self.stats["len_hist"][_n] = self.stats["len_hist"].get(_n, 0) + 1
             self.pending[req_id] = tree
             self.stats["depth_hist"][
                 min(int(tree.depths.max()) if len(tree.depths) else 0, 64)] += 1
-            out[i] = tree.token_ids
+            # 🔴 짧은 트리는 앞쪽만 채운다. 남는 자리는 0 이지만 스케줄러에는
+            #    draft_lens 로 잘라서 넘기므로 그 토큰은 쓰이지 않는다.
+            out[i, :_n] = tree.token_ids
         _t3 = time.perf_counter()
         _r = torch.from_numpy(out).to(self.device)
         self.t["p_out"] += time.perf_counter() - _t3
@@ -268,6 +275,17 @@ class DDTreeRuntime:
         self._rope = None
         self.masked_trees = set()   # 이번 스텝에 실제로 트리 마스크를 받은 트리들
         self.stats["steps"] += 1
+        # 🔴 self.step 은 배치 인덱스로 트리를 들고 있는데, GDN·마스크 계층은
+        #    **스펙 요청만** 순서대로 본다. 배치에 prefill 이 섞이면 두 인덱스가
+        #    어긋나 트리가 엉뚱한 요청에 붙거나 아예 매칭이 실패한다.
+        #    스펙 요청 안에서의 순위(spec_rank)를 함께 기록한다.
+        self.spec_rank = {}
+        _rank = 0
+        for i in range(num_reqs):
+            req_id = req_ids[i]
+            if scheduled_spec_tokens.get(req_id):
+                self.spec_rank[i] = _rank
+                _rank += 1
         for i in range(num_reqs):
             req_id = req_ids[i]
             tree = self.pending.get(req_id)
@@ -390,38 +408,57 @@ class DDTreeRuntime:
         return _r
 
     # ---- GDN(재귀 계층)용 ----
-    def gdn_info(self, n_spec_reqs: int, T: int, width: int = 4):
-        """GDN 계층용 묶음. 못 맞추면 None → 전부 사슬로 물러선다."""
+    def gdn_info(self, n_spec_reqs: int, T, width: int = 4):
+        """GDN 계층용 묶음. 못 맞추면 None → 전부 사슬로 물러선다.
+
+        T 는 이번 스텝의 요청별 토큰 수다. 정수(모든 요청이 같음) 또는
+        요청 순서대로의 시퀀스를 받는다. 커널은 cu_seqlens 로 요청별 길이를
+        이미 다루므로 균일할 필요가 없다 — 이 검사만 맞으면 된다.
+        """
         if self.in_drafter:
             return None
         self.stats["gdn_calls"] += 1
         if not self.step:
             self.stats["gdn_no_step"] += 1
             return None
-        if len(self.step) != n_spec_reqs:
+        # 🔴 배치에 트리 있는 요청과 없는 요청이 섞일 수 있다. 예전에는 전부
+        #    맞아야만 트리 정보를 주고 아니면 None 을 돌렸는데, 물러선 자리가
+        #    8토큰 상한이 있는 원본 커널이라 예산>8 이면 죽는다.
+        #    요청별로 독립 처리한다 — 트리가 있으면 트리 부모, 없으면 사슬 부모.
+        #    마스크 공급자도 세그먼트별로 짝을 지으므로(트리 없는 요청은 causal)
+        #    어텐션과 GDN 이 요청 단위로 일관된다.
+        lens = list(T) if not isinstance(T, int) else [T] * n_spec_reqs
+        if len(lens) != n_spec_reqs:
             self.stats["gdn_nreq_mismatch"] += 1
-            self.stats["gdn_last"] = f"nreq {len(self.step)} vs {n_spec_reqs}"
             return None
-        want = self.step[0][1].num_nodes
-        if want != T:
-            self.stats["gdn_T_mismatch"] += 1
-            self.stats["gdn_last"] = f"T {want} vs {T}"
-            return None
-        par = self.tree_parents_tensor(n_spec_reqs, T)
+        # 배치 인덱스를 스펙 요청 순위로 옮긴다 (GDN 이 보는 순서)
+        # 🔴 self.step 의 i 는 배치 인덱스다. GDN 이 보는 스펙 요청 순서와
+        #    같다고 가정한다 — 전부 디코딩 중인 배치에서는 성립하지만, prefill 이
+        #    섞이면 어긋난다 (아래 '알려진 한계' 참조). 어긋나면 gdn_par_none 이
+        #    올라가고 그 스텝은 안전하게 물러선다 (루트 토큰만 방출 = 무손실).
+        by_idx = {i: t for i, t in self.step}
+        key_by_rank = {i: self.all_req_ids[i] for i, _ in self.step}
+        for i, t in by_idx.items():
+            if i < len(lens) and t.num_nodes != lens[i]:
+                self.stats["gdn_T_mismatch"] += 1
+                self.stats["gdn_last"] = f"req{i} T {t.num_nodes} vs {lens[i]}"
+                return None
+        par = self.tree_parents_tensor(n_spec_reqs, max(lens), lens, by_idx)
         if par is None:
             self.stats["gdn_par_none"] += 1
             return None
         self.stats["gdn_tree"] += 1
-        from vllm.v1.spec_decode.ddtree.gdn import tree_cols_tensor
+        from vllm.v1.spec_decode.ddtree.gdn import cols_from_parents
+        # parents 에서 바로 만든다 — 트리 없는 요청의 사슬 부모도 그대로 반영된다.
         return {
-            "tree_cols": tree_cols_tensor(
-                [t for _, t in self.step], width, self.device
-            ),
+            "tree_cols": cols_from_parents(par, lens, width, self.device),
             "parents": par,
-            "keys": list(self.step_req_ids),
+            # 압축은 트리를 실제로 받은 요청에만 적용한다 (없으면 None → 건너뜀).
+            "keys": [key_by_rank.get(r) for r in range(n_spec_reqs)],
         }
 
-    def tree_parents_tensor(self, n_spec_reqs: int, T: int):
+    def tree_parents_tensor(self, n_spec_reqs: int, T: int,
+                            lens=None, by_idx=None):
         """[n_spec_reqs, T] int32 부모 배열. 루트는 -1. 못 맞추면 None.
 
         하이브리드 타깃의 GDN 계층이 쓴다 — SSM 은 부모 슬롯에서 상태를 재적재하고
@@ -432,11 +469,21 @@ class DDTreeRuntime:
         """
         if not self.step or len(self.step) != n_spec_reqs:
             return None
+        # 🔴 요청마다 트리 크기가 다를 수 있다. [n, max_T] 로 패딩한다 — 커널은
+        #    cu_seqlens 로 각 요청의 길이만큼만 읽으므로 패딩 값은 쓰이지 않는다.
+        #    트리가 없는 요청은 사슬 부모([-1,0,1,...])를 준다. 그 요청은
+        #    causal 마스크를 받으므로 사슬이 곧 올바른 의미다.
         rows = []
-        for _, tree in self.step:
-            if tree.num_nodes != T:
-                return None
-            rows.append(tree.parents)          # parents[0] == -1
+        for i in range(n_spec_reqs):
+            tree = by_idx.get(i) if by_idx is not None else None
+            L = lens[i] if lens is not None else T
+            if tree is not None:
+                if tree.num_nodes > T:
+                    return None
+                row = list(tree.parents)
+            else:
+                row = [-1] + list(range(L - 1))
+            rows.append(row + [-1] * (T - len(row)))
         return torch.tensor(rows, dtype=torch.int32, device=self.device)
 
     # ------------------------------------------------------------------ 5
@@ -576,7 +623,7 @@ class DDTreeRuntime:
         _tc = time.perf_counter()
         # 🔴 수용 경로 인덱스는 캐시 그룹과 무관하다. 예전에는 그룹 루프 안에서
         #    요청마다 as_tensor/arange 를 다시 만들어 (그룹 x 요청) 번 H2D 가 났다.
-        #    하이브리드는 그룹이 3개라 그대로 3배였다. 한 번만 만든다.
+        #    그룹은 하이브리드에서 3개라 그대로 3배였다. 한 번만 만든다.
         n = 0
         seg = [0]
         a_flat, i_flat = [], []
@@ -593,8 +640,10 @@ class DDTreeRuntime:
         a_idx = torch.as_tensor(a_flat, dtype=torch.long, device=dev)
         i_idx = torch.as_tensor(i_flat, dtype=torch.long, device=dev)
         seg_t = torch.tensor(seg, dtype=torch.int32, device=dev)
+        self.t["c_idx"] += time.perf_counter() - _tc
 
         # 그룹별 src/dst 를 먼저 다 만들고, 안전성 검사는 **한 번에** 동기화한다.
+        _tc = time.perf_counter()
         plans = []
         for slot_mapping, block_size in self.groups:
             caches = self._attn_caches(kv_caches, block_size)
@@ -606,20 +655,19 @@ class DDTreeRuntime:
         if not plans:
             return
 
-        # 🔴 compact_kv_triton 은 세그먼트 안에서 순차로 돌면서 dst[i] <= src[i]
-        #    (둘 다 증가) 를 전제로 한다. a[i] >= i 는 항상 참이지만, 그게 슬롯으로
-        #    옮겨가려면 slot_mapping 이 이 구간에서 단조 증가여야 한다. 토큰이 KV 블록
-        #    경계를 넘으면 다음 블록 id 가 더 작을 수 있어(블록은 free pool 에서 나온다)
-        #    전제가 깨지고, 나중 쓰기가 앞선 읽기의 원본을 덮는다.
-        #
-        # 🔴 예전에는 이 검사를 그룹마다 .item() 으로 불러 스텝당 그룹 수만큼
-        #    파이프라인이 섰다. 전부 쌓아 한 번만 내린다.
         _tv = time.perf_counter()
+        # 🔴 예전에는 그룹마다 .item() 을 불러 스텝당 그룹 수만큼 파이프라인이 섰다.
+        #    전부 쌓아 한 번만 내린다.
         _viols = torch.stack([(d > s_).sum() for _, _, s_, d in plans]).tolist()
         self.t["c_viol"] += time.perf_counter() - _tv
 
         for (caches, block_size, _src, _dst), _viol in zip(plans, _viols):
             _viol = int(_viol)
+            # 🔴 compact_kv_triton 은 세그먼트 안에서 순차로 돌면서 dst[i] <= src[i]
+            #    (둘 다 증가) 를 전제로 한다. a[i] >= i 는 항상 참이지만, 그게 슬롯으로
+            #    옮겨가려면 slot_mapping 이 이 구간에서 단조 증가여야 한다. 토큰이 KV 블록
+            #    경계를 넘으면 다음 블록 id 가 더 작을 수 있어(블록은 free pool 에서 나온다)
+            #    전제가 깨지고, 나중 쓰기가 앞선 읽기의 원본을 덮는다.
             self.stats["kv_groups"] += 1
             self.stats["kv_rows"] += n
             if _viol:

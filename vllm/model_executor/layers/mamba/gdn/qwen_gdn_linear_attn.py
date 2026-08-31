@@ -119,6 +119,16 @@ def set_ddtree_gdn_provider(fn) -> None:
     _DDTREE_GDN_PROVIDER = fn
 
 
+def _ddtree_active() -> bool:
+    """DDTree 공급자가 붙어 있는가.
+
+    🔴 이걸 먼저 봐야 한다. 아래 트리 정보 준비는 cu_seqlens / state_indices 를
+       CPU 로 내리는데(계층당 2회 D2H), DDTree 를 안 쓰는 사용자에게 그 비용을
+       지우면 안 된다. GDN 계층이 24개라 스텝당 48회다.
+    """
+    return _DDTREE_GDN_PROVIDER is not None
+
+
 def _ddtree_gdn(n_spec_reqs: int, T: int, width: int = 4):
     if _DDTREE_GDN_PROVIDER is None:
         return None
@@ -1369,20 +1379,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
-            _n_spec = attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
-            _T = mixed_qkv_spec.shape[0] // max(1, _n_spec)
-            _info = _ddtree_gdn(_n_spec, _T, conv_weights.shape[-1])
-            self._ddtree_info = _info
-            if _info is not None:
+            _info = None
+            if _ddtree_active():
                 from vllm.v1.spec_decode.ddtree.gdn import (register_state,
                                                             tolist_cached)
 
+                _n_spec = attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
                 # 🔴 계층마다 내리면 스텝당 24회 D2H 다. 내용은 계층 간 동일하다.
-                register_state(
-                    id(self), conv_state, ssm_state,
-                    tolist_cached("ssi", spec_state_indices_tensor[:_n_spec]),
-                    conv_weights.shape[-1], _info["keys"],
-                )
+                _cl = tolist_cached("qsl", spec_query_start_loc[: _n_spec + 1])
+                _T = [_cl[i + 1] - _cl[i] for i in range(_n_spec)]
+                _info = _ddtree_gdn(_n_spec, _T, conv_weights.shape[-1])
+                if _info is not None:
+                    register_state(
+                        id(self), conv_state, ssm_state,
+                        tolist_cached("ssi",
+                                      spec_state_indices_tensor[:_n_spec]),
+                        conv_weights.shape[-1], _info["keys"],
+                    )
+            self._ddtree_info = _info
             mixed_qkv_spec = causal_conv1d_update(
                 mixed_qkv_spec,
                 conv_state,
@@ -1772,19 +1786,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
         # --- DDTree: 융합 경로에서도 트리 정보를 세운다 (conv + SSM 이 같은 _info) ---
-        _T = num_actual_tokens // max(1, num_requests)
-        _info = _ddtree_gdn(num_requests, _T, conv_weights.shape[-1])
-        self._ddtree_info = _info
-        if _info is not None:
+        # 🔴 요청마다 드래프트 길이가 다를 수 있다. cu_seqlens 에서 실제 길이를
+        #    뽑는다 (균등 분할 가정을 쓰면 가변 길이에서 어긋난다).
+        _info = None
+        if _ddtree_active():
             from vllm.v1.spec_decode.ddtree.gdn import (register_state,
                                                         tolist_cached)
 
-            # 🔴 계층마다 내리면 스텝당 24회 D2H 다. 내용은 계층 간 동일하다.
-            register_state(
-                id(self), conv_state, self.kv_cache[1],
-                tolist_cached("si", state_indices[:num_requests]),
-                conv_weights.shape[-1], _info["keys"],
-            )
+            _cl = tolist_cached("cus", cu_seqlens[: num_requests + 1])
+            _T = [_cl[i + 1] - _cl[i] for i in range(num_requests)]
+            _info = _ddtree_gdn(num_requests, _T, conv_weights.shape[-1])
+            if _info is not None:
+                register_state(
+                    id(self), conv_state, self.kv_cache[1],
+                    tolist_cached("si", state_indices[:num_requests]),
+                    conv_weights.shape[-1], _info["keys"],
+                )
+        self._ddtree_info = _info
         # --- DDTree 진단: conv 상태를 스텝 경계로 덤프한다 (VLLM_DDTREE_CONVDUMP=N) ---
         #     합성 호출이 아니라 프로덕션 인자 그대로 잡아야 인계 검증이 성립한다.
         _cd = _ddtree_conv_dump_begin(

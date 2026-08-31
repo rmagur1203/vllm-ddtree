@@ -44,8 +44,39 @@ def tree_conv_columns(parents: list[int], width: int) -> np.ndarray:
 
 
 def tree_cols_tensor(trees, width: int, device) -> torch.Tensor:
-    """[n_spec, T, width-1] int32 절대열. 커널이 이 인덱스로 윈도를 읽는다."""
+    """[n_spec, max_T, width-1] int32 절대열. 커널이 이 인덱스로 윈도를 읽는다.
+
+    🔴 요청마다 트리 크기가 다를 수 있으므로 max_T 로 패딩한다. 커널은
+       query_start_loc 으로 각 요청의 길이만큼만 읽으므로 패딩 값은 쓰이지
+       않는다 — 다만 인덱스로 쓰이므로 0 이 아니라 히스토리 열(0)을 채워
+       범위를 벗어나지 않게 한다.
+    """
     rows = [tree_conv_columns(t.parents, width)[:, : width - 1] for t in trees]
+    mt = max(r.shape[0] for r in rows)
+    if any(r.shape[0] != mt for r in rows):
+        rows = [r if r.shape[0] == mt else
+                np.concatenate([r, np.zeros((mt - r.shape[0], r.shape[1]), r.dtype)])
+                for r in rows]
+    return torch.from_numpy(np.stack(rows).astype(np.int32)).to(device)
+
+
+def cols_from_parents(parents, lens, width: int, device) -> torch.Tensor:
+    """[n, max_T, width-1] int32 절대열을 부모 배열에서 직접 만든다.
+
+    트리가 없는 요청은 사슬 부모가 들어 있으므로 자연히 순차 윈도가 된다.
+    요청마다 길이가 다르면 max_T 로 패딩하고, 패딩 자리는 히스토리 열(0)로
+    채운다 — 인덱스로 쓰이므로 범위를 벗어나면 안 된다.
+    """
+    par = parents.tolist() if hasattr(parents, "tolist") else parents
+    mt = max(lens)
+    rows = []
+    for r, row in enumerate(par):
+        L = lens[r]
+        cols = tree_conv_columns(list(row[:L]), width)[:, : width - 1]
+        if L < mt:
+            cols = np.concatenate(
+                [cols, np.zeros((mt - L, cols.shape[1]), cols.dtype)])
+        rows.append(cols)
     return torch.from_numpy(np.stack(rows).astype(np.int32)).to(device)
 
 
@@ -104,19 +135,17 @@ def validate_tree_inputs(*, parents, cu_seqlens, state_indices, tree_cols=None,
 
 _LAYERS: dict = {}   # layer_id -> (conv_state, ssm_state, slots, width, keys)
 
-# 스텝 안에서 계층끼리 공유하는 D2H 결과.
-#
-# 🔴 GDN 계층 24개가 각각 state_indices 를 .tolist() 하면 스텝당 24회 동기화가
-#    되는데, 내용은 계층마다 **동일하다** (같은 스텝의 같은 메타데이터).
-#    한 번만 내리고 나눠 쓴다.
+# 스텝 안에서 계층끼리 공유하는 D2H 결과. GDN 계층 24개가 각각
+# cu_seqlens / state_indices 를 .tolist() 하면 스텝당 48회 동기화가 되는데,
+# 내용은 계층마다 **동일하다**. 한 번만 내리고 나눠 쓴다.
 _STEP_MEMO: dict = {}
 
 
 def new_step() -> None:
     """스텝 경계. 계층 간 공유 캐시를 비운다.
 
-    🔴 반드시 스텝마다 불러야 한다. data_ptr 를 키에 쓰므로, 안 비우면 해제된
-       버퍼 주소가 재사용됐을 때 지난 스텝 값을 돌려줄 수 있다.
+    🔴 반드시 스텝마다 불러야 한다. data_ptr 를 키에 쓰므로, 안 비우면
+       해제된 버퍼 주소가 재사용됐을 때 지난 스텝 값을 돌려줄 수 있다.
     """
     _STEP_MEMO.clear()
 
