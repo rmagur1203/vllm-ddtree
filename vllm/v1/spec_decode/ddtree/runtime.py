@@ -24,7 +24,7 @@ import numpy as np
 import torch
 
 from vllm.v1.spec_decode.ddtree.tree import (Tree, build_tree, build_tree_from_logits, follow_tree,
-                         shape_and_build)
+                         shape_and_build, topk_from_logits)
 from vllm.v1.spec_decode.ddtree import compact as compact_mod
 
 
@@ -95,7 +95,10 @@ class DDTreeRuntime:
                   "kv_compact": 0.0, "gdn_compact": 0.0, "rope": 0.0,
                   # accept 내부 — 대기와 실제 작업을 가른다 (time_split 참고)
                   "a_wait": 0.0, "a_meta": 0.0, "a_argmax": 0.0,
-                  "a_loop": 0.0, "a_out": 0.0}
+                  "a_loop": 0.0, "a_out": 0.0,
+                  # propose 내부 — p_topk 는 D2H 를 포함하므로 드래프터 forward
+                  # 대기가 섞인다. p_wait 로 떼려면 time_split 을 켠다.
+                  "p_wait": 0.0, "p_topk": 0.0, "p_build": 0.0, "p_out": 0.0}
         global LAST
         LAST = self
 
@@ -144,8 +147,6 @@ class DDTreeRuntime:
            유지한다 (gpu_model_runner.py:1979 의 isinstance 단언,
            :1989 의 flatten() 인덱싱, :5055 의 shape[1]).
 
-        🔴 요청마다 topk 결과를 CPU 로 내리므로 배치가 크면 동기화 비용이 크다.
-           성능 측정(M5) 전에 배치 topk + 단일 D2H 로 바꿔야 한다.
         """
         vocab = logits.shape[-1]
         lg = logits.view(-1, drafter_k, vocab)
@@ -154,18 +155,40 @@ class DDTreeRuntime:
         #    텐서 하나로 모든 요청이 공유하므로, 요청마다 트리 크기가 다르면
         #    짧은 쪽을 늘려야 하고 그러면 모양이 뒤틀린다.
         _short_ok = self.true_chain and self.dynamic_tau is not None and n == 1
+
+        # 🔴 배치 전체를 한 번에 topk 한다. 예전에는 요청마다
+        #    build_tree_from_logits 를 불러 D2H 가 2n회 났고, 복사마다 앞선 GPU
+        #    작업(드래프터 forward)을 기다리느라 파이프라인이 섰다. 이제 2회다.
+        #    실측(vocab 151936, 깊이 15, 예산 16): 요청 64에서 24.49 -> 14.96 ms.
+        if self.time_split:
+            _tw = time.perf_counter()
+            torch.cuda.synchronize()
+            self.t["p_wait"] += time.perf_counter() - _tw
+        _t1 = time.perf_counter()
+        _rows = min(n, lg.shape[0])
+        lp_all, ids_all, _topk = (None, None, 0)
+        if _rows > 0:
+            lp_all, ids_all, _topk = topk_from_logits(
+                lg[:_rows, : self.depth_cap], self.budget, self.topk_cap)
+        self.t["p_topk"] += time.perf_counter() - _t1
+
+        _t2 = time.perf_counter()
         trees: dict = {}
         for i, req_id in enumerate(req_ids):
-            if i >= lg.shape[0]:
+            if i >= _rows:
                 self.pending.pop(req_id, None)
                 continue
-            _lg = lg[i][: self.depth_cap]
-            tree = build_tree_from_logits(
-                _lg, self.budget, topk_cap=self.topk_cap, spine=self.spine,
-                depth_bonus=self.depth_bonus, dynamic_tau=self.dynamic_tau,
-                allow_short=_short_ok,
+            # 여기서부터는 순수 CPU 다 — GPU 를 다시 만지지 않는다.
+            tree = shape_and_build(
+                lp_all[i], ids_all[i], self.budget, topk=_topk,
+                spine=self.spine, depth_bonus=self.depth_bonus,
+                dynamic_tau=self.dynamic_tau, allow_short=_short_ok,
+                # 🔴 여기서 끄면 안 된다. 진짜 사슬로 갈지는 shape_and_build 가
+                #    스텝마다 판단하고, 트리로 남으면 패딩이 있어야 폭이 맞는다.
+                pad_to_budget=True,
             )
             trees[i] = tree
+        self.t["p_build"] += time.perf_counter() - _t2
         width = max((t.num_nodes - 1 for t in trees.values()), default=self.budget)
         width = max(1, min(width, self.budget))
         out = np.zeros((n, width), dtype=np.int64)
@@ -185,7 +208,9 @@ class DDTreeRuntime:
             self.stats["depth_hist"][
                 min(int(tree.depths.max()) if len(tree.depths) else 0, 64)] += 1
             out[i] = tree.token_ids
+        _t3 = time.perf_counter()
         _r = torch.from_numpy(out).to(self.device)
+        self.t["p_out"] += time.perf_counter() - _t3
         self.t["propose"] += time.perf_counter() - _t0
         return _r
 
