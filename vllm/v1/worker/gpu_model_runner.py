@@ -5525,6 +5525,18 @@ class GPUModelRunner(
 
                 self._setup_eagle3_aux_hidden_state_outputs()
 
+                # --- DDTree: 계층별 CUDA 이벤트 계측 (VLLM_DDTREE_LAYERPROF=1) ---
+                try:
+                    from vllm.v1.spec_decode.ddtree import layerprof as _lp
+
+                    if _lp.enabled():
+                        _lp.attach(self.model, "target")
+                        _d = getattr(self, "drafter", None)
+                        if _d is not None and getattr(_d, "model", None) is not None:
+                            _lp.attach(_d.model, "drafter")
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning("DDTree layerprof 부착 실패: %s", _e)
+
                 # Resolve the MoE model, unwrapping VLM wrappers if needed.
                 # VLM models (e.g. KimiK25ForConditionalGeneration) wrap the
                 # actual MoE language model but don't implement

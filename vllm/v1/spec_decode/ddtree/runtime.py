@@ -48,6 +48,13 @@ class DDTreeRuntime:
         # 확신 시 예산 전부를 깊이에 쏟는다. 트리가 예산보다 짧아질 수 있어
         # 스텝의 드래프트 폭이 줄어든다 — 요청이 하나일 때만 켠다(아래 참조).
         self.true_chain = _os.environ.get("VLLM_DDTREE_TRUECHAIN") == "1"
+        # 계측 전용. 구간 앞에서 한 번 동기화해 '앞선 GPU 작업 대기'와 '우리 CPU
+        # 작업'을 분리한다. 켜면 파이프라인이 서므로 성능 측정에는 쓰지 않는다.
+        #
+        # 🔴 이게 없으면 구간 시간을 통째로 오독한다. .tolist()/.item() 은 앞서
+        #    큐에 든 GPU 작업이 끝날 때까지 CPU 를 세우므로, 그 대기가 우리
+        #    비용으로 잡힌다 (실측: accept 1.87 ms 중 1.66 ms 가 타깃 forward 대기).
+        self.time_split = _os.environ.get("VLLM_DDTREE_TIMESPLIT") == "1"
         self.trace_n = int(_os.environ.get("VLLM_DDTREE_TRACE", "0"))
         self.trace: list = []
         self._emitted: dict = {}
@@ -85,7 +92,10 @@ class DDTreeRuntime:
                       "dyn": {"chain": [0, 0], "tree": [0, 0]}}
         # 구간별 누적 시간(초) — 병목을 숫자로 본다
         self.t = {"propose": 0.0, "mask": 0.0, "accept": 0.0,
-                  "kv_compact": 0.0, "gdn_compact": 0.0, "rope": 0.0}
+                  "kv_compact": 0.0, "gdn_compact": 0.0, "rope": 0.0,
+                  # accept 내부 — 대기와 실제 작업을 가른다 (time_split 참고)
+                  "a_wait": 0.0, "a_meta": 0.0, "a_argmax": 0.0,
+                  "a_loop": 0.0, "a_out": 0.0}
         global LAST
         LAST = self
 
@@ -403,19 +413,30 @@ class DDTreeRuntime:
     def accept(self, logits: torch.Tensor, spec_md):
         _t0 = time.perf_counter()
         """T=0 검증. 반환: ([num_reqs, width] (-1 패딩), {배치인덱스: 수용경로})."""
+        if self.time_split:
+            _tw = time.perf_counter()
+            torch.cuda.synchronize()
+            self.t["a_wait"] += time.perf_counter() - _tw
+        _ta = time.perf_counter()
         cu = spec_md.cu_num_sampled_tokens.tolist()
         starts = [0] + cu[:-1]
+        self.t["a_meta"] += time.perf_counter() - _ta
+        _ta = time.perf_counter()
         argmax = logits.argmax(dim=-1).tolist()
+        self.t["a_argmax"] += time.perf_counter() - _ta
         by_index = dict(self.step)
 
+        _ta = time.perf_counter()
         # 트리가 없는 요청의 드래프트 개수 확인용
         cu_draft = spec_md.cu_num_draft_tokens.tolist()
         d_starts = [0] + cu_draft[:-1]
+        self.t["a_meta"] += time.perf_counter() - _ta
 
         width = max(spec_md.num_draft_tokens) + 1
         out = torch.full((self.num_reqs, width), -1, dtype=torch.int64)
         paths: dict[int, list[int]] = {}
 
+        _tl = time.perf_counter()
         for i in range(self.num_reqs):
             sampled = argmax[starts[i] : cu[i]]
             tree = by_index.get(i)
@@ -477,7 +498,10 @@ class DDTreeRuntime:
                 self._emitted.get(self.all_req_ids[i], 0) + len(emitted))
             out[i, : len(emitted)] = torch.tensor(emitted, dtype=torch.int64)
 
+        self.t["a_loop"] += time.perf_counter() - _tl
+        _to = time.perf_counter()
         _r = out.to(logits.device), paths
+        self.t["a_out"] += time.perf_counter() - _to
         self.t["accept"] += time.perf_counter() - _t0
         return _r
 
