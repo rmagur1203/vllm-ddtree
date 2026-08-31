@@ -3723,7 +3723,18 @@ class GPUModelRunner(
             if self.ddtree is not None and self.ddtree.active:
                 _rp = self.ddtree.rope_positions(self.positions, num_input_tokens)
                 if _rp is not None:
-                    positions = _rp
+                    # 🔴 cudagraph 로 캡처된 조각은 캡처 당시의 self.positions
+                    #    **주소**를 읽는다. 새 텐서로 지역 변수만 갈아끼우면
+                    #    그래프는 그걸 못 보고 연속 위치를 그대로 써서 깊이
+                    #    RoPE 가 조용히 무시된다. 정적 버퍼에 제자리로 쓴다.
+                    #    드래프터가 뒤에서 self.positions 를 다시 읽으므로
+                    #    (propose 의 _get_positions) 원본을 들고 있다가 되돌린다.
+                    self._ddt_pos_saved = (
+                        num_input_tokens,
+                        self.positions[:num_input_tokens].clone(),
+                    )
+                    self.positions[:num_input_tokens].copy_(_rp)
+                    positions = self.positions[:num_input_tokens]
 
         if is_first_rank:
             intermediate_tensors = None
@@ -3775,6 +3786,10 @@ class GPUModelRunner(
 
         # --- DDTree: 트리 워크로 검증하고 수용 경로 KV 를 앞으로 당긴다 ---
         if self.ddtree is not None and self.ddtree.active:
+            _sv = getattr(self, "_ddt_pos_saved", None)
+            if _sv is not None:      # 깊이 위치를 되돌린다 (드래프터가 읽는다)
+                self.positions[: _sv[0]].copy_(_sv[1])
+                self._ddt_pos_saved = None
             _tok, _paths = self.ddtree.accept(logits, spec_decode_metadata)
             self.ddtree.compact(self.kv_caches, _paths)
             return SamplerOutput(sampled_token_ids=_tok, logprobs_tensors=None)
