@@ -1834,6 +1834,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # --- DDTree: 트리면 8토큰 상한 없는 우리 CUDA 커널로 ---
         _info = getattr(self, "_ddtree_info", None)
+        # 🔴 트리 정보가 없어도, 폭이 원본 커널의 8토큰 상한을 넘으면 원본으로
+        #    물러설 수 없다 (state_indices must have shape [N,S] with S<=8).
+        #    이때는 사슬 부모를 만들어 우리 커널로 처리한다 — 사슬은 원본과
+        #    의미가 같고 우리 커널에는 상한이 없다. 배치에 트리 있는 요청과
+        #    없는 요청이 섞이면 실제로 여기로 온다.
+        if _info is None and state_indices.size(1) > MAX_FUSED_GDN_MTP_TOKENS:
+            _cl = cu_seqlens[: num_requests + 1].tolist()
+            _mx = state_indices.size(1)
+            _rows = []
+            for _r in range(num_requests):
+                _L = _cl[_r + 1] - _cl[_r]
+                _rows.append([-1] + list(range(_L - 1)) + [-1] * (_mx - _L))
+            _info = {"parents": torch.tensor(_rows, dtype=torch.int32,
+                                             device=state_indices.device)}
         if _info is not None:
             from vllm.v1.spec_decode.ddtree.cuda_ext import get_ext
 
