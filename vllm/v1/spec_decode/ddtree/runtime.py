@@ -59,6 +59,12 @@ class DDTreeRuntime:
         self.no_mask = False       # True 면 마스크 자체를 안 준다 — 이분법용
         self.in_drafter = False    # 드래프터 forward 중에는 트리 마스크를 주면 안 된다
         self.use_ngram_drafter = True   # dflash 드래프터가 없을 때의 테스트 경로
+        # 🔴 ngram 경로는 n 을 하나만 봤다. 순정 vLLM 제안기는
+        #    prompt_lookup_min..max 를 훑으므로, 맞춰주지 않으면 순정과
+        #    비교할 때 DDTree 만 드래프트를 훨씬 덜 낸다 (§25).
+        #    SPAN="2-4" 로 순정과 같게 맞춘다.
+        _sp = _os.environ.get("VLLM_DDTREE_NGRAM_SPAN")
+        self.ngram_span = ([int(x) for x in _sp.split("-")] if _sp else None)
 
         self.pending: dict[str, Tree] = {}          # req_id -> 다음 스텝용 트리
         self.step: list[tuple[int, Tree]] = []      # (배치인덱스, 트리) — 이번 스텝
@@ -85,6 +91,8 @@ class DDTreeRuntime:
                       "gdn_par_none": 0, "gdn_last": None,
                       "gdn_cmp": None, "kv_groups": 0, "kv_rows": 0,
                       "tree_underfilled": 0, "compact_unsafe": 0,
+                      # ngram 경로가 트리를 못 만든 이유를 가른다 (§25)
+                      "ng_nomatch": 0, "ng_underfill": 0, "ng_ok": 0,
                       # 요청별 드래프트 길이 분포 — 갈리는지 확인용
                       "len_hist": {},
                       # 평균만 보면 꼬리가 안 보인다 — 분포를 직접 센다
@@ -114,6 +122,7 @@ class DDTreeRuntime:
             seq = token_ids_cpu[i, :n_tok]
             lp, ids = self._ngram_distributions(seq)
             if lp is None:
+                self.stats["ng_nomatch"] += 1
                 self.pending.pop(req_id, None)
                 out.append([])
                 continue
@@ -131,9 +140,11 @@ class DDTreeRuntime:
             # ngram 경로는 list[list[int]] 을 돌려주므로 요청마다 길이가 달라도 된다.
             # 짧은 드래프트를 허용하지 않을 때만 예산과 일치해야 한다.
             if _n < 1 or (not _short and _n != self.budget):
+                self.stats["ng_underfill"] += 1
                 self.pending.pop(req_id, None)
                 out.append([])
                 continue
+            self.stats["ng_ok"] += 1
             self.pending[req_id] = tree
             self.stats["len_hist"][_n] = self.stats["len_hist"].get(_n, 0) + 1
             out.append([int(t) for t in tree.token_ids])
@@ -229,14 +240,25 @@ class DDTreeRuntime:
         일치가 여러 개면 그게 곧 '드래프터의 불확실성'이고, DDTree 는 바로 그 위에
         가지를 친다. 일치가 하나뿐이면 체인(= 평범한 ngram)이 된다.
         """
-        n = self.ngram_n
-        if len(seq) < n + 1:
-            return None, None
-        pat = seq[-n:]
-        # 마지막 n-gram 과 같은 위치들 (자기 자신 제외)
-        win = np.lib.stride_tricks.sliding_window_view(seq[:-1], n)
-        hits = np.nonzero((win == pat).all(axis=1))[0]
-        if hits.size == 0:
+        # 🔴 순정 vLLM 제안기는 prompt_lookup_min..max 를 긴 쪽부터 훑어 처음
+        #    맞는 길이를 쓴다. n 하나만 보면 순정보다 덜 맞고, 그만큼 스펙
+        #    디코딩을 아예 못 돌린다 (§24-5: 스텝의 75% 가 트리 없음).
+        if self.ngram_span:
+            _lo, _hi = self.ngram_span
+            _cands = range(min(_hi, len(seq) - 1), _lo - 1, -1)
+        else:
+            _cands = (self.ngram_n,)
+        n, hits = None, None
+        for _n in _cands:
+            if _n < 1 or len(seq) < _n + 1:
+                continue
+            pat = seq[-_n:]
+            win = np.lib.stride_tricks.sliding_window_view(seq[:-1], _n)
+            h = np.nonzero((win == pat).all(axis=1))[0]
+            if h.size:
+                n, hits = _n, h
+                break
+        if hits is None:
             return None, None
 
         topk = max(1, min(self.budget, self.topk_cap))
