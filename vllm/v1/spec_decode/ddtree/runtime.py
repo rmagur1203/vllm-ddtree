@@ -587,6 +587,12 @@ class DDTreeRuntime:
                         "sampled": [int(x) for x in sampled],
                         "accepted": [int(x) for x in acc],
                         "lp_top": tree.lp_top,
+                        # 보정 측정용: 노드별 부모 조건부 log-prob 과 그 깊이의 rank
+                        "node_lp": (None if tree.node_lp is None
+                                    else [None if v != v else float(v)
+                                          for v in tree.node_lp]),
+                        "node_rank": (None if tree.node_rank is None
+                                      else [int(v) for v in tree.node_rank]),
                     })
                 self.stats["accepted"] += len(acc) - 1
                 self.stats["nodes"] += tree.num_nodes - 1

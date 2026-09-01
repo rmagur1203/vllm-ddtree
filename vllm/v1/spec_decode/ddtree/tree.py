@@ -27,6 +27,12 @@ class Tree:
     child_maps: list[dict[int, int]]   # child_maps[i][token] = 자식 인덱스
     num_nodes: int                 # 루트 포함
 
+    # 노드별 '부모 조건부' log-prob 과 그 깊이에서의 rank.
+    # 🔴 누적이 아니라 조건부여야 보정 측정이 성립한다 — 누적은 조상까지 섞여
+    #    (깊이, rank) 칸마다 표본이 갈라진다.
+    node_lp: np.ndarray | None = field(default=None, repr=False)
+    node_rank: np.ndarray | None = field(default=None, repr=False)
+
     _vis: np.ndarray | None = field(default=None, repr=False)
     # 깊이별 상위 2개 log-prob — 드래프터 확률의 보정 상태를 사후 분석하려고 남긴다
     lp_top: list | None = field(default=None, repr=False)
@@ -71,13 +77,16 @@ def build_tree(
     """
     depth_limit, topk = top_log_probs.shape
     if budget <= 0 or depth_limit == 0:
-        return Tree(np.empty(0, np.int64), np.empty(0, np.int64), [-1], [dict()], 1)
+        return Tree(np.empty(0, np.int64), np.empty(0, np.int64), [-1], [dict()], 1,
+                    node_lp=np.empty(0, np.float32), node_rank=np.empty(0, np.int32))
 
     # (정렬키, ranks, 부모인덱스, 깊이, rank, 누적logw) — ranks 는 동점 처리용
     heap: list[tuple[float, tuple[int, ...], int, int, int, float]] = []
 
     node_token_ids = np.empty(budget, dtype=np.int64)
     node_depths = np.empty(budget, dtype=np.int64)
+    node_lp = np.empty(budget, dtype=np.float32)
+    node_rank = np.empty(budget, dtype=np.int32)
     parents = np.empty(budget + 1, dtype=np.int32)
     parents[0] = -1
     child_maps: list[dict[int, int]] = [dict()]
@@ -94,6 +103,8 @@ def build_tree(
             cur = n + 1
             node_token_ids[n] = token_id
             node_depths[n] = d
+            node_lp[n] = lp
+            node_rank[n] = 0
             parents[cur] = parent_index
             child_maps.append(dict())
             child_maps[parent_index][token_id] = cur
@@ -114,6 +125,8 @@ def build_tree(
         cur = n + 1
         node_token_ids[n] = token_id
         node_depths[n] = depth
+        node_lp[n] = float(top_log_probs[depth - 1, rank])
+        node_rank[n] = rank
         parents[cur] = parent_index
         child_maps.append(dict())
         child_maps[parent_index][token_id] = cur
@@ -135,6 +148,8 @@ def build_tree(
         parents=parents[: n + 1].tolist(),
         child_maps=child_maps,
         num_nodes=n + 1,
+        node_lp=node_lp[:n],
+        node_rank=node_rank[:n],
     )
 
 
@@ -244,6 +259,9 @@ def shape_and_build(lp: np.ndarray, ids: np.ndarray, budget: int, *,
         lp = lp + depth_bonus
     tree = build_tree(lp[:, :topk], ids[:, :topk], budget, spine=spine)
     tree.lp_top = (lp[:, : min(2, lp.shape[1])] - depth_bonus).tolist()
+    if depth_bonus and tree.node_lp is not None:
+        # 보정 측정은 '드래프터가 말한 값' 을 봐야 하므로 보정분을 되돌린다.
+        tree.node_lp = tree.node_lp - depth_bonus
     tree.dyn_mode = _mode
     tree.e_chain = e_chain
     if pad_to_budget:
@@ -284,6 +302,13 @@ def pad_tree_to_budget(tree: Tree, depth0_ids: np.ndarray, budget: int) -> Tree:
         [tree.depths, np.asarray(extra_depths, dtype=tree.depths.dtype)])
     tree.parents.extend([0] * len(extra_tokens))
     tree.child_maps.extend({} for _ in extra_tokens)
+    if tree.node_lp is not None:
+        # 패딩 노드는 깊이 0 분포의 '안 쓴' 상위 토큰이라 rank 를 모른다.
+        # 보정 측정에서 빼려고 rank=-1 로 표시한다.
+        tree.node_lp = np.concatenate(
+            [tree.node_lp, np.full(len(extra_tokens), np.nan, np.float32)])
+        tree.node_rank = np.concatenate(
+            [tree.node_rank, np.full(len(extra_tokens), -1, np.int32)])
     tree.num_nodes += len(extra_tokens)
     tree._vis = None                                   # 캐시 무효화
     return tree
