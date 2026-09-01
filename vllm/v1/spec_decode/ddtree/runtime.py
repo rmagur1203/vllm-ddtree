@@ -631,7 +631,10 @@ class DDTreeRuntime:
         self.t["a_meta"] += time.perf_counter() - _ta
 
         width = max(spec_md.num_draft_tokens) + 1
-        out = torch.full((self.num_reqs, width), -1, dtype=torch.int64)
+        # 🔴 numpy 로 만든다. 예전에는 torch.full 한 번 + **요청마다** torch.tensor
+        #    한 번이었는데, eager 텐서 생성은 개당 수십 us 라 요청 수에 비례해
+        #    붙었다. 배치 1 에서는 안 보이고 배치가 커지면 그대로 드러난다.
+        out_np = np.full((self.num_reqs, width), -1, dtype=np.int64)
         paths: dict[int, list[int]] = {}
 
         _tl = time.perf_counter()
@@ -700,11 +703,11 @@ class DDTreeRuntime:
 
             self._emitted[self.all_req_ids[i]] = (
                 self._emitted.get(self.all_req_ids[i], 0) + len(emitted))
-            out[i, : len(emitted)] = torch.tensor(emitted, dtype=torch.int64)
+            out_np[i, : len(emitted)] = emitted
 
         self.t["a_loop"] += time.perf_counter() - _tl
         _to = time.perf_counter()
-        _r = out.to(logits.device), paths
+        _r = torch.from_numpy(out_np).to(logits.device), paths
         self.t["a_out"] += time.perf_counter() - _to
         self.t["accept"] += time.perf_counter() - _t0
         return _r
@@ -785,10 +788,16 @@ class DDTreeRuntime:
         if n == 0:
             self.t["c_idx"] += time.perf_counter() - _tc
             return
-        # H2D 는 여기 세 번뿐이다 (인덱스 2 + 세그먼트 1).
-        a_idx = torch.as_tensor(a_flat, dtype=torch.long, device=dev)
-        i_idx = torch.as_tensor(i_flat, dtype=torch.long, device=dev)
-        seg_t = torch.tensor(seg, dtype=torch.int32, device=dev)
+        # 🔴 인덱스 두 개를 **한 번**에 올린다. .to(device) 는 호출마다 전송
+        #    하나라 두 번이면 두 번 선다. 어차피 바로 뒤에서 같은 slot_mapping 을
+        #    두 번 gather 하므로, 이어붙여 올리면 **gather 도 한 번**이 된다.
+        #    (인덱스 텐서는 int64 여야 한다 — advanced indexing 의 제약.)
+        _n = n
+        _cat = np.empty(2 * _n, dtype=np.int64)
+        _cat[:_n] = a_flat
+        _cat[_n:] = i_flat
+        ai_idx = torch.from_numpy(_cat).to(dev)
+        seg_t = torch.from_numpy(np.asarray(seg, dtype=np.int32)).to(dev)
         self.t["c_idx"] += time.perf_counter() - _tc
 
         # 그룹별 src/dst 를 먼저 다 만들고, 안전성 검사는 **한 번에** 동기화한다.
@@ -798,8 +807,10 @@ class DDTreeRuntime:
             caches = self._attn_caches(kv_caches, block_size)
             if not caches:
                 continue
-            plans.append((caches, block_size,
-                          slot_mapping[a_idx], slot_mapping[i_idx]))
+            # gather 한 번 + int32 캐스트 한 번. 자르기는 뷰라 공짜다.
+            # (예전에는 그룹마다 gather 2회 + 커널 호출부에서 캐스트 2회였다.)
+            _sm = slot_mapping[ai_idx].to(torch.int32)
+            plans.append((caches, block_size, _sm[:_n], _sm[_n:]))
         self.t["c_idx"] += time.perf_counter() - _tc
         if not plans:
             return
@@ -835,8 +846,7 @@ class DDTreeRuntime:
                                              block_size)
             else:
                 compact_mod.compact_kv_triton(
-                    caches, _src.to(torch.int32), _dst.to(torch.int32),
-                    seg_t, block_size,
+                    caches, _src, _dst, seg_t, block_size,   # 이미 int32 다
                 )
             self.t["c_kernel"] += time.perf_counter() - _tk
         self.t["kv_compact"] += time.perf_counter() - _t0
