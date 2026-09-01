@@ -229,6 +229,18 @@ sub("""        else:
             assert self.speculator is not None""",
     """        elif self.ddtree is not None and self.ddtree.active:
             # --- DDTree: 사슬 기각 샘플러 대신 트리 워크로 검증한다 ---
+            # 🔴 배치 샤딩 샘플링과 같이 쓰면 안 된다. 그 경우 이 시점의
+            #    input_batch 는 **이 랭크가 맡은 요청만** 담고 있는데, DDTree 의
+            #    상태(step / all_req_ids / q_start / groups)는 훅 2 에서 전역
+            #    배치로 채워졌다. 인덱스가 어긋나 압축이 남의 슬롯을 건드리고
+            #    수용이 다른 요청에 매핑된다 — 조용히 깨지므로 여기서 세운다.
+            #    (기본값은 False 라 TP=2 만으로는 켜지지 않는다. TP>1 이어도
+            #     모든 랭크가 전체 logits 을 받아 같은 트리를 만든다.)
+            if getattr(self, "batch_sharder", None) is not None:
+                raise RuntimeError(
+                    "DDTree 는 enable_batch_sharded_sampling 과 같이 쓸 수 없다 "
+                    "(훅 2 의 전역 배치 인덱스와 어긋난다)."
+                )
             _tok, _paths = self.ddtree.accept(logits, _DDTSpecMD(input_batch))
             self.ddtree.compact(self.kv_caches, _paths)
             # 🔴 V2 의 SamplerOutput 은 num_sampled/num_rejected 를 요구한다
