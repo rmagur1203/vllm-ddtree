@@ -179,9 +179,26 @@ if __name__ == "__main__":
 
     rounds = []
     texts = None
+    # 🔴 배치 1 에서는 '요청마다 도는 비용' 이 안 보인다. 운영은 max-num-seqs 64 다.
+    BATCH = os.environ.get("DDT_BATCH") == "1"
     for r in range(REPS):
         per = []
         ts = []
+        if BATCH:
+            s0 = _STEPS[0]; t0 = time.perf_counter()
+            outs = llm.generate(list(PROMPTS), sp, use_tqdm=False)
+            dt = time.perf_counter() - t0
+            n = sum(len(o.outputs[0].token_ids) for o in outs)
+            per.append({"name": "batch", "wall": dt, "tokens": n,
+                        "token_ids": [list(o.outputs[0].token_ids) for o in outs],
+                        "tok_s": n / dt, "steps": _STEPS[0] - s0,
+                        "ms_per_step": 1000 * dt / max(1, _STEPS[0] - s0)})
+            ts = [o.outputs[0].text for o in outs]
+            texts = ts
+            tot = dt
+            rounds.append({"per": per, "total": tot})
+            print(f"  [{TAG}] {r+1}/{REPS} 배치 합계 {tot:.3f}s  {n} 토큰", flush=True)
+            continue
         for name, p in zip(NAMES, PROMPTS):
             s0 = _STEPS[0]
             t0 = time.perf_counter()
@@ -214,6 +231,12 @@ if __name__ == "__main__":
                 res["trace"] = _rt.LAST.trace
             # 구간 시간 — 오버헤드가 어디서 나오는지 귀속하려면 이게 있어야 한다
             res["t"] = dict(_rt.LAST.t)
+            try:
+                from vllm.v1.spec_decode.ddtree import tree as _tr
+                _tr.tk_drain()
+                res["tk"] = dict(_tr.TK_T)
+            except Exception:
+                pass
     except Exception as e:
         res["stats_error"] = repr(e)
 
