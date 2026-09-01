@@ -26,7 +26,9 @@ ARCH = os.environ.get("DDT_ARCH", "attn")
 # attn=Qwen3-0.6B(너무 작아 스펙 디코딩이 base 에 진다, §24-2)
 # attn8=Qwen3-8B(스펙 디코딩이 cudagraph 에서도 값을 하는 크기)
 _MODELS = {"attn": "Qwen/Qwen3-0.6B", "attn8": "Qwen/Qwen3-8B",
-           "hybrid": "Qwen/Qwen3.5-4B"}
+           "hybrid": "Qwen/Qwen3.5-4B",
+           # 운영 모델. 드래프터는 DFlash2 다.
+           "b27": "cyankiwi/Qwen3.8-27B-AWQ-INT4"}
 REPS = int(os.environ.get("DDT_REPS", "3"))
 BUDGET = int(os.environ.get("DDT_BUDGET", "16"))
 TAG = os.environ.get("DDT_TAG", f"{ARCH}_{MODE}_{'e' if EAGER else 'cg'}")
@@ -131,15 +133,29 @@ kw = dict(
     max_num_seqs=int(os.environ.get("DDT_MAXSEQS", "4")),
     max_num_batched_tokens=int(os.environ.get("DDT_MAXLEN", "1024")),
 )
-if ARCH == "hybrid":
-    kw["mamba_cache_mode"] = "align"
+if ARCH in ("hybrid", "b27"):
+    kw["mamba_cache_mode"] = "align"      # GDN 하이브리드
 # DDT_DRAFTER=ngram | eagle3
 #   ngram  : vLLM NgramProposer (V2 미지원 -> V1 폴백)
 #   eagle3 : 모델 드래프터. 커버리지 100% 라 ngram 의 72% 불발이 없다 (§27-1).
 DRAFTER = os.environ.get("DDT_DRAFTER", "ngram")
+DFLASH2 = os.environ.get("DDT_DFLASH2", "z-lab/Qwen3.8-27B-DFlash2")
 EAGLE3_MODEL = os.environ.get("DDT_EAGLE3", "AngelSlim/Qwen3-8B_eagle3")
 if MODE in ("ddtree", "ngram"):
-    if DRAFTER == "eagle3":
+    if DRAFTER == "dflash2":
+        # 🔴 DFlash2 는 dflash_config 가 없어 drafter_k = num_speculative_tokens
+        #    를 따라간다. 예산을 학습 지평(8) 밖으로 키우면 드래프터가 조용히
+        #    어긋난 폭으로 동작한다 — 27B 측정은 예산 <= 8 에서만 유효하다.
+        kw["speculative_config"] = {
+            "method": "dflash", "model": DFLASH2,
+            "num_speculative_tokens": BUDGET, "attention_backend": "FLASHINFER",
+            # DDTree 는 깊이별 분포가 필요하다. 온도 0 이면 gumbel 경로가 순수
+            # argmax 로 떨어지므로(gumbel.py 의 gumbel_noised_argmax) 드래프트
+            # 자체는 그리디와 동일하고 logits 만 추가로 저장된다.
+            **({"draft_sample_method": "probabilistic"}
+               if os.environ.get("DDT_DRAFT_PROB") == "1" else {}),
+        }
+    elif DRAFTER == "eagle3":
         kw["speculative_config"] = {
             "method": "eagle3", "model": EAGLE3_MODEL,
             "num_speculative_tokens": BUDGET,
