@@ -128,7 +128,7 @@ kw = dict(
     gpu_memory_utilization=float(os.environ.get("DDT_UTIL", "0.20")),
     enforce_eager=EAGER,
     enable_prefix_caching=False,
-    max_num_seqs=4,
+    max_num_seqs=int(os.environ.get("DDT_MAXSEQS", "4")),
     max_num_batched_tokens=int(os.environ.get("DDT_MAXLEN", "1024")),
 )
 if ARCH == "hybrid":
@@ -181,6 +181,12 @@ if __name__ == "__main__":
     texts = None
     # 🔴 배치 1 에서는 '요청마다 도는 비용' 이 안 보인다. 운영은 max-num-seqs 64 다.
     BATCH = os.environ.get("DDT_BATCH") == "1"
+    # 🔴 동시 요청 수를 실험 변수로. 프롬프트가 모자라면 돌려쓴다 (접두사 캐싱은
+    #    꺼져 있으므로 같은 프롬프트라도 각자 계산한다).
+    _nreq = int(os.environ.get("DDT_NREQ", "0"))
+    if BATCH and _nreq:
+        PROMPTS = [PROMPTS[i % len(PROMPTS)] for i in range(_nreq)]
+        NAMES = [f"{NAMES[i % len(NAMES)]}{i}" for i in range(_nreq)]
     for r in range(REPS):
         per = []
         ts = []
