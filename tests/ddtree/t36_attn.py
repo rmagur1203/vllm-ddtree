@@ -131,6 +131,10 @@ kw = dict(
     enforce_eager=EAGER,
     enable_prefix_caching=False,
     max_num_seqs=int(os.environ.get("DDT_MAXSEQS", "4")),
+    tensor_parallel_size=int(os.environ.get("DDT_TP", "1")),
+    # 🔴 이 박스에서 P2P 는 VMware passthrough IOMMU fault 로 VM 을 죽인다.
+    #    TP>1 이면 반드시 커스텀 all-reduce 를 꺼야 한다 (운영 compose 도 같다).
+    disable_custom_all_reduce=True,
     max_num_batched_tokens=int(os.environ.get("DDT_MAXLEN", "1024")),
 )
 if ARCH in ("hybrid", "b27"):
