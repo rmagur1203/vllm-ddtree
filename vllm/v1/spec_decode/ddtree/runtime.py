@@ -356,11 +356,18 @@ class DDTreeRuntime:
             self._rope = positions[:total_tokens].clone()
             for idx, tree in active:
                 s = int(self.q_start[idx])
-                base = int(self.num_computed[idx])
+                # 🔴 기준 위치를 num_computed 배열에서 읽으면 안 된다. 그건 CPU
+                #    미러라 비동기 스펙 디코딩에서 '낙관적 상한' 이다 — 스케줄러가
+                #    드래프트 전량 수용을 가정해 미리 올려둔다. V1 은 스텝 끝의
+                #    deferred_spec_decode_corrections 가 CPU 값도 되감아줘서
+                #    증상이 없지만, 그 보정 순서에 의존하는 건 위험하다.
+                #    V2 는 같은 보정을 GPU 에서만 해서 실제로 터졌다 (§32).
+                #    positions 는 양쪽 다 num_computed_tokens(GPU)로 만든 권위값이니
+                #    루트 자리 값을 그대로 쓴다 — GPU 스칼라라 D2H 도 없다.
                 d = np.concatenate([[0], tree.depths])       # 루트 깊이 0
                 self._rope[s : s + tree.num_nodes] = torch.from_numpy(d).to(
                     self._rope.device, self._rope.dtype
-                ) + base
+                ) + positions[s]
             self.t["rope"] += time.perf_counter() - _t0
         return self._rope
 
