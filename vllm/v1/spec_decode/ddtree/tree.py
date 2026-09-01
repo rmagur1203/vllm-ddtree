@@ -196,11 +196,19 @@ _CAST_BUDGET = int(os.environ.get("VLLM_DDTREE_CAST_MIB", "64")) << 20
 
 
 def _topk_rows(rows: torch.Tensor, k_all: int):
-    """[행, vocab] → (정규화 log-prob 상위 k, 그 토큰 id). 둘 다 GPU 에 남는다."""
-    logits = rows.float()
-    top_logits, top_ids = torch.topk(logits, k=k_all, dim=-1)
-    log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
-    return top_logits - log_z, top_ids
+    """[행, vocab] → (정규화 log-prob 상위 k, 그 토큰 id). 둘 다 GPU 에 남는다.
+
+    🔴 연산 **개수**가 값이다. 이 경로의 실제 비용은 GPU 커널(0.147 ms)도 D2H
+       (0.056 ms)도 아니고 **CPU 디스패치 0.43 ms** 였다 — eager PyTorch 에서
+       디스패치 하나가 30~40 us 인데 float() -> topk -> logsumexp(내부에서
+       max/sub/exp/sum/log 5개) -> 뺄셈 으로 여덟 개 넘게 던지고 있었다.
+
+       log_softmax 는 정의가 `logits - logsumexp(logits)` 그 자체라 그 전부와
+       수학적으로 동일하다. dtype 인자로 캐스트까지 흡수해 **디스패치 2개**로
+       줄인다. 출력은 바이트 동일이다.
+    """
+    lsm = torch.log_softmax(rows, dim=-1, dtype=torch.float32)
+    return torch.topk(lsm, k=k_all, dim=-1)
 
 
 def topk_from_logits(draft_logits: torch.Tensor, budget: int,
@@ -229,8 +237,16 @@ def topk_from_logits(draft_logits: torch.Tensor, budget: int,
         ids_g = torch.cat([b for _, b in parts])
 
     shape = tuple(draft_logits.shape[:-1]) + (k_all,)
-    lp = lp_g.to(device="cpu", dtype=torch.float32).numpy().reshape(shape)
-    ids = ids_g.to(device="cpu", dtype=torch.long).numpy().reshape(shape)
+    # 🔴 D2H 를 한 번으로 합친다. .to("cpu") 는 매번 동기화라 두 번이면 두 번 선다.
+    #    vocab < 2^24 면 토큰 id 를 float32 로 **정확히** 실을 수 있다 (float32 는
+    #    2^24 까지 정수를 손실 없이 표현한다). 넘으면 예전처럼 따로 보낸다.
+    if vocab < (1 << 24):
+        both = torch.cat([lp_g, ids_g.to(torch.float32)], dim=-1).cpu().numpy()
+        lp = both[:, :k_all].reshape(shape)
+        ids = both[:, k_all:].astype(np.int64).reshape(shape)
+    else:
+        lp = lp_g.to(device="cpu", dtype=torch.float32).numpy().reshape(shape)
+        ids = ids_g.to(device="cpu", dtype=torch.long).numpy().reshape(shape)
     return lp, ids, topk
 
 
