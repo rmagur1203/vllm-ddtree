@@ -70,6 +70,8 @@ class DDTreeRuntime:
         self.depth_cap = 1 << 30   # 드래프터 깊이를 잘라 얕은 트리만 만든다 — 디버깅용
         self.no_accept = False     # True 면 절대 수용 안 함 — 배선 격리용
         self.no_mask = False       # True 면 마스크 자체를 안 준다 — 이분법용
+        # 퇴화 빠른 경로를 끄는 스위치 — A/B 로 출력 동일성을 확인할 때 쓴다
+        self._nofast = _os.environ.get("VLLM_DDTREE_NOFAST") == "1"
         self.in_drafter = False    # 드래프터 forward 중에는 트리 마스크를 주면 안 된다
         self.use_ngram_drafter = True   # dflash 드래프터가 없을 때의 테스트 경로
         # 🔴 ngram 경로는 n 을 하나만 봤다. 순정 vLLM 제안기는
@@ -104,6 +106,8 @@ class DDTreeRuntime:
                       "gdn_par_none": 0, "gdn_last": None,
                       "gdn_cmp": None, "kv_groups": 0, "kv_rows": 0,
                       "tree_underfilled": 0, "compact_unsafe": 0,
+                      # 퇴화 빠른 경로가 얼마나 걸리는지
+                      "c_skip": 0, "c_work": 0,
                       # ngram 경로가 트리를 못 만든 이유를 가른다 (§25)
                       "ng_nomatch": 0, "ng_underfill": 0, "ng_ok": 0,
                       # 요청별 드래프트 길이 분포 — 갈리는지 확인용
@@ -677,12 +681,31 @@ class DDTreeRuntime:
         n = 0
         seg = [0]
         a_flat, i_flat = [], []
+        identity = True
         for idx, acc in paths.items():
             base = int(self.q_start[idx])
             a_flat.extend(base + a for a in acc)
             i_flat.extend(range(base, base + len(acc)))
+            # 🔴 퇴화 빠른 경로. 수용 경로가 [0,1,2,...] 면 a_flat == i_flat 이라
+            #    압축은 '같은 값을 같은 자리에 쓰기' — 완전한 무연산이다. 그런데도
+            #    H2D 3회, 캐시 그룹마다 slot gather, 안전성 검사의 D2H **동기화**,
+            #    커널 런치까지 전부 돌고 있었다. 그 D2H 가 특히 나쁘다 — 앞서 큐에
+            #    든 GPU 작업이 끝날 때까지 CPU 를 세운다.
+            #    판정은 공짜다. 수용 경로는 이미 CPU 에 있다. 척추를 그대로 받아낸
+            #    스텝이 곧 이 경우라 실측에서 59% (1161/1965) 가 여기로 빠진다.
+            if identity:
+                for _j, _a in enumerate(acc):
+                    if _a != _j:
+                        identity = False
+                        break
             n += len(acc)
             seg.append(n)
+        if identity and not self._nofast:
+            self.stats["c_skip"] += 1
+            self.t["c_idx"] += time.perf_counter() - _tc
+            self.t["kv_compact"] += time.perf_counter() - _t0
+            return
+        self.stats["c_work"] += 1
         if n == 0:
             self.t["c_idx"] += time.perf_counter() - _tc
             return
@@ -708,7 +731,14 @@ class DDTreeRuntime:
         _tv = time.perf_counter()
         # 🔴 예전에는 그룹마다 .item() 을 불러 스텝당 그룹 수만큼 파이프라인이 섰다.
         #    전부 쌓아 한 번만 내린다.
-        _viols = torch.stack([(d > s_).sum() for _, _, s_, d in plans]).tolist()
+        # 🔴 이 검사 자체가 D2H 동기화다. triton 커널이 dst<=src 순서를 전제하기
+        #    때문에 필요한데, torch 구현(gather 후 scatter)은 전제가 없으니 검사할
+        #    이유도 없다. (실측: torch 로 바꿔 동기화를 빼도 커널이 더 느려
+        #    순손해였다 — triton + 검사가 여전히 낫다. 손잡이만 정확히 둔다.)
+        if self.compact_impl == "torch":
+            _viols = [0] * len(plans)
+        else:
+            _viols = torch.stack([(d > s_).sum() for _, _, s_, d in plans]).tolist()
         self.t["c_viol"] += time.perf_counter() - _tv
 
         for (caches, block_size, _src, _dst), _viol in zip(plans, _viols):
