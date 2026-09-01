@@ -38,8 +38,13 @@ class DDTreeRuntime:
         self.depth_limit = depth_limit    # 드래프터 지평 (트리 최대 깊이)
         self.device = device
         self.ngram_n = ngram_n
-        self.topk_cap = topk_cap   # 1 이면 분기 없음(순수 사슬) — 디버깅용
         import os as _os
+        # 🔴 topk_cap=1 이면 분기가 없어 '트리 기계는 그대로 쓰되 모양만 사슬'
+        #    이 된다. 사슬 기준선과 비교할 때 **오버헤드와 모양 선택을 가르는
+        #    유일한 방법**이라 손잡이로 뺀다. 실제로 이걸로 처음 갈렸다:
+        #    모양=사슬이면 토큰/스텝이 vLLM 사슬과 정확히 같은데(2.213) 시간은
+        #    +9.1% 였다 — 즉 여태 본 손해의 대부분은 모양이 아니라 기계값이다.
+        self.topk_cap = int(_os.environ.get("VLLM_DDTREE_TOPK", topk_cap))
         self.compact_impl = _os.environ.get("VLLM_DDTREE_COMPACT", "triton")
         self.spine = _os.environ.get("VLLM_DDTREE_SPINE") == "1"
         self.depth_bonus = float(_os.environ.get("VLLM_DDTREE_BETA", "0"))
