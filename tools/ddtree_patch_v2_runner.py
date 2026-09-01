@@ -21,7 +21,7 @@ def sub(old, new, what):
 
 # ── 훅 5 헬퍼 + import ────────────────────────────────────────────
 i = s.index("\nimport ")
-s = s[:i] + "\nimport contextlib" + s[i:]
+s = s[:i] + "\nimport contextlib\nimport os as _os_ddt" + s[i:]
 sub("logger = init_logger(__name__)", '''logger = init_logger(__name__)
 
 
@@ -41,7 +41,27 @@ def _ddt_drafter(runner):
         yield
     finally:
         dd.in_drafter = False
-''', "훅5 헬퍼")
+
+
+class _DDTSpecMD:
+    """DDTree.accept 이 기대하는 V1 SpecDecodeMetadata 모양의 어댑터.
+
+    V2 는 같은 정보를 InputBatch 에 다른 이름으로 들고 있다. numpy 로 만들어
+    두면 .tolist() 가 GPU 동기화를 일으키지 않는다.
+    """
+
+    def __init__(self, input_batch):
+        import numpy as _np
+
+        nd = input_batch.num_draft_tokens_per_req
+        if nd is None:
+            nd = _np.zeros(input_batch.num_reqs, dtype=_np.int32)
+        self.num_draft_tokens = [int(x) for x in nd]
+        self.cu_num_draft_tokens = _np.cumsum(nd, dtype=_np.int64)
+        # V1 은 선행 0 을 뺀 누적을 쓴다 (starts = [0] + cu[:-1])
+        self.cu_num_sampled_tokens = _np.asarray(
+            input_batch.cu_num_logits_np[1:], dtype=_np.int64)
+''', "훅5 헬퍼 + accept 어댑터")
 
 # ── 훅 1: 런타임 생성 + 공급자 등록 ───────────────────────────────
 sub("""        # Speculative decoding.
@@ -145,6 +165,83 @@ for tail in ("self.speculator.propose(", "draft_tokens = self.speculator.propose
 print(f"  적용: 훅5 드래프터 가드 ({n}곳)")
 if n == 0:
     raise SystemExit("🔴 propose 호출 지점을 못 찾았다")
+
+
+# ── 훅 6: 드래프터의 깊이별 logits 로 트리를 만든다 ────────────────
+sub("""            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens""",
+    """            # --- DDTree: 드래프터가 낸 평면 사슬을 버리고, 같은 깊이별
+            #     분포 위에 가지를 친 트리를 대신 스케줄한다 ---
+            if self.ddtree is not None and not self.ddtree.use_ngram_drafter:
+                _lg = getattr(self.speculator, "draft_logits", None)
+                if _lg is None:
+                    raise RuntimeError(
+                        "DDTree(V2): speculator.draft_logits 가 없다. "
+                        "draft_sample_method='probabilistic' 이어야 깊이별 "
+                        "logits 가 캐시된다 (그리디면 argmax 만 하고 버린다)."
+                    )
+                _n = input_batch.num_reqs
+                # 🔴 draft_logits 는 num_speculative_steps 열인데, 드래프터
+                #    루프를 VLLM_DDTREE_DEPTH 로 끊으면 **앞쪽 그만큼만**
+                #    채워진다. 나머지는 초기값(0.0) 이라 균일분포이고, 그 위에
+                #    가지를 치면 전부 쓰레기 노드가 된다.
+                #    (실측: 예산16/깊이5 에서 노드 16.1개에 수용 1.61)
+                _dep = int(_os_ddt.environ.get("VLLM_DDTREE_DEPTH", "0"))
+                _k = self.speculator.num_speculative_steps
+                if _dep:
+                    _k = min(_k, max(1, _dep))
+                # 🔴 draft_logits 는 [max_num_reqs, ...] 로 **영속 슬롯**
+                #    (req_state_idx) 기준이다. 배치 앞 n행을 그냥 집으면
+                #    채워지지 않은 슬롯을 읽는다 — 전부 0인 배열이라 topk 가
+                #    가장 낮은 토큰 ID(1,3,4,6…)를 돌려주고, 트리가 통째로
+                #    쓰레기가 된다. idx_mapping 으로 모아야 한다.
+                _rows = _lg[input_batch.idx_mapping[:_n]][:, :_k]
+                if _os_ddt.environ.get("VLLM_DDTREE_LGDBG") == "1":
+                    _nz = int((_rows != 0).sum())
+                    logger.info(
+                        "DDTree lgdbg: shape=%s dtype=%s nonzero=%d "
+                        "min=%.3f max=%.3f col0_nonzero=%d",
+                        tuple(_rows.shape), _rows.dtype, _nz,
+                        float(_rows.min()), float(_rows.max()),
+                        int((_rows[:, 0] != 0).sum()))
+                _tree = self.ddtree.propose_from_drafter_logits(
+                    input_batch.req_ids[:_n], _rows.reshape(_n * _k, -1), _k)
+                if _tree is not None:
+                    draft_tokens = _tree
+            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens""",
+    "훅6 트리 제안")
+
+
+# ── 훅 4: 트리 워크로 수용하고 수용 경로 KV 를 앞으로 당긴다 ───────
+sub("""        else:
+            # Rejection sampling for spec decoding.
+            assert self.rejection_sampler is not None
+            assert self.speculator is not None""",
+    """        elif self.ddtree is not None and self.ddtree.active:
+            # --- DDTree: 사슬 기각 샘플러 대신 트리 워크로 검증한다 ---
+            _tok, _paths = self.ddtree.accept(logits, _DDTSpecMD(input_batch))
+            self.ddtree.compact(self.kv_caches, _paths)
+            # 🔴 V2 의 SamplerOutput 은 num_sampled/num_rejected 를 요구한다
+            #    (V1 은 안 그랬다). 방출 토큰 수에서 역산한다.
+            #    d개 드래프트를 스케줄했으면 방출은 1..d+1 이고
+            #    기각 = d - (방출 - 1) 이다.
+            _ns = (_tok >= 0).sum(dim=1).to(torch.int32)
+            _nd = torch.as_tensor(
+                input_batch.num_draft_tokens_per_req
+                if input_batch.num_draft_tokens_per_req is not None
+                else [0] * input_batch.num_reqs,
+                dtype=torch.int32, device=_ns.device)
+            sampler_output = SamplerOutput(
+                sampled_token_ids=_tok,
+                logprobs_tensors=None,
+                num_nans=None,
+                num_sampled=_ns,
+                num_rejected=(_nd - (_ns - 1)).clamp_(min=0),
+            )
+        else:
+            # Rejection sampling for spec decoding.
+            assert self.rejection_sampler is not None
+            assert self.speculator is not None""",
+    "훅4 트리 수용 + KV 압축")
 
 io.open(dst, "w", encoding="utf-8").write(s)
 compile(s, dst, "exec")
