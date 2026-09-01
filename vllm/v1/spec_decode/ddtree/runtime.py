@@ -70,6 +70,9 @@ class DDTreeRuntime:
         self.depth_cap = 1 << 30   # 드래프터 깊이를 잘라 얕은 트리만 만든다 — 디버깅용
         self.no_accept = False     # True 면 절대 수용 안 함 — 배선 격리용
         self.no_mask = False       # True 면 마스크 자체를 안 준다 — 이분법용
+        # 사슬 트리에는 custom_mask 를 안 준다 (causal 과 동치라 옳다).
+        # custom_mask 커널의 값을 파이프라인을 켠 채로 재는 유일한 방법이기도 하다.
+        self.skip_chain_mask = _os.environ.get("VLLM_DDTREE_CHAINMASK", "1") != "0"
         # 퇴화 빠른 경로를 끄는 스위치 — A/B 로 출력 동일성을 확인할 때 쓴다
         self._nofast = _os.environ.get("VLLM_DDTREE_NOFAST") == "1"
         self.in_drafter = False    # 드래프터 forward 중에는 트리 마스크를 주면 안 된다
@@ -108,6 +111,7 @@ class DDTreeRuntime:
                       "tree_underfilled": 0, "compact_unsafe": 0,
                       # 퇴화 빠른 경로가 얼마나 걸리는지
                       "c_skip": 0, "c_work": 0,
+                      "chain_mask_skip": 0,
                       "local_mask": 0,
                       # ngram 경로가 트리를 못 만든 이유를 가른다 (§25)
                       "ng_nomatch": 0, "ng_underfill": 0, "ng_ok": 0,
@@ -319,6 +323,7 @@ class DDTreeRuntime:
         self.q_start = np.asarray(query_start_loc_np[: num_reqs + 1])
         self._rope = None
         self.masked_trees = set()   # 이번 스텝에 실제로 트리 마스크를 받은 트리들
+        self.causal_ok = set()      # 사슬이라 마스크 없이도 옳은 트리들
         self.stats["steps"] += 1
         # 🔴 self.step 은 배치 인덱스로 트리를 들고 있는데, GDN·마스크 계층은
         #    **스펙 요청만** 순서대로 본다. 배치에 prefill 이 섞이면 두 인덱스가
@@ -375,7 +380,8 @@ class DDTreeRuntime:
                 _tw = time.perf_counter(); torch.cuda.synchronize()
                 self.t["r_wait"] += time.perf_counter() - _tw
             _t0 = time.perf_counter()
-            active = [(i, t) for i, t in self.step if id(t) in self.masked_trees]
+            active = [(i, t) for i, t in self.step
+                      if id(t) in self.masked_trees or id(t) in self.causal_ok]
             self.stats["rope_skipped"] += len(self.step) - len(active)
             if not active:
                 return None
@@ -451,7 +457,16 @@ class DDTreeRuntime:
             q = qs[j + 1] - qs[j]
             k = kvs[j]
             tree = pairing.get(j)
-            if tree is not None and tree.num_nodes == q and k >= q:
+            if (tree is not None and tree.num_nodes == q and k >= q
+                    and self.skip_chain_mask and tree.is_chain):
+                # 🔴 사슬 트리의 가시성은 causal 과 정확히 같다. custom_mask 를
+                #    주면 FlashInfer 가 프리필 마스크 커널로 넘어가는데 얻는 게
+                #    없다. 수용은 정상으로 돌아야 하므로 따로 표시한다.
+                a = np.arange(q)[:, None]; bb = np.arange(k)[None, :]
+                m = bb <= (k - q) + a
+                self.causal_ok.add(id(tree))
+                self.stats["chain_mask_skip"] += 1
+            elif tree is not None and tree.num_nodes == q and k >= q:
                 m = np.ones((q, k), dtype=np.bool_)
                 m[:, k - q :] = tree.visibility
                 self.masked_trees.add(id(tree))
@@ -461,6 +476,12 @@ class DDTreeRuntime:
                 b = np.arange(k)[None, :]
                 m = b <= (k - q) + a                        # 우측정렬 causal
             parts.append(torch.from_numpy(m.reshape(-1)))
+        if not self.masked_trees:
+            # 🔴 진짜 트리 마스크가 하나도 필요 없으면 **None 을 반환해야** 한다.
+            #    causal 마스크를 만들어 넘기면 값은 같아도 FlashInfer 는 그대로
+            #    custom_mask 커널로 간다 — 생략의 의미가 없어진다.
+            self.t["mask"] += time.perf_counter() - _t0
+            return None
         _r = torch.cat(parts).to(self.device)
         self.t["mask"] += time.perf_counter() - _t0
         return _r
@@ -629,7 +650,7 @@ class DDTreeRuntime:
                 and tree.num_nodes == len(sampled)
                 # 🔴 트리 마스크를 실제로 받은 요청만 트리로 검증한다.
                 #    causal 마스크로 계산된 logits 로 트리 워크를 하면 무손실이 깨진다.
-                and id(tree) in self.masked_trees
+                and (id(tree) in self.masked_trees or id(tree) in self.causal_ok)
             ):
                 acc, _ = follow_tree(tree, sampled)
                 paths[i] = acc

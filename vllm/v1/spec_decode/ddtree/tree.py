@@ -40,6 +40,16 @@ class Tree:
     e_chain: float | None = field(default=None, repr=False)  # 기대 사슬 길이
 
     @property
+    def is_chain(self) -> bool:
+        """가시성이 causal 과 같은가 — 즉 노드가 0,1,2,... 로 한 줄인가.
+
+        사슬 트리는 마스크를 줄 필요가 없다. causal 경로가 그대로 옳다.
+        (마스크를 안 주면 accept 가 그 트리를 거부하므로, 런타임이 이런 트리를
+         따로 표시해서 수용은 정상으로 돌게 해야 한다.)
+        """
+        return all(self.parents[i] == i - 1 for i in range(1, self.num_nodes))
+
+    @property
     def visibility(self) -> np.ndarray:
         """[num_nodes, num_nodes] bool — vis[i][j] 는 노드 i 가 j 를 볼 수 있는가.
         조상과 자기 자신만 True (ancestor-only 마스크)."""
