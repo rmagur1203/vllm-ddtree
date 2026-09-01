@@ -88,6 +88,9 @@ sub("""        # Speculative decoding.
             # V2 는 모델 드래프터만 지원한다 (ngram 은 V1 폴백) — §28
             self.ddtree.use_ngram_drafter = False
             _fi.set_ddtree_mask_provider(self.ddtree.mask_provider)
+            # 마스크 2분할용 q x q 공급자 (VLLM_DDTREE_SPLIT=1 일 때만 쓰인다)
+            if hasattr(_fi, "set_ddtree_local_mask_provider"):
+                _fi.set_ddtree_local_mask_provider(self.ddtree.local_mask_provider)
             try:
                 from vllm.model_executor.layers.mamba.gdn import (
                     qwen_gdn_linear_attn as _gdn,
@@ -115,6 +118,14 @@ sub("            block_tables, slot_mappings = self.prepare_attn(input_batch)",
                     input_batch.num_computed_tokens_np,
                     input_batch.query_start_loc_np,
                 )
+                if self.ddtree.trace_n:
+                    # 노드 문맥 사후 검증용. 접두사를 추정하지 않고 vLLM 이
+                    # 어텐션에 실제로 쓰는 배열에서 그대로 읽는다.
+                    self.ddtree.set_prefix_probe(
+                        self.req_states.all_token_ids.gpu,
+                        self.req_states.num_computed_tokens.gpu,
+                        input_batch.idx_mapping_np,
+                    )
                 # 🔴 V2 의 슬롯 매핑은 [그룹, 토큰] 텐서다. 그룹별 블록 크기와
                 #    짝지어 넘긴다 (V1 은 block_table 객체 목록이었다).
                 self.ddtree.groups = [
