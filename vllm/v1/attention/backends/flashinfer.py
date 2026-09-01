@@ -7,6 +7,8 @@ from enum import Enum
 from functools import partial
 from typing import ClassVar
 
+import os
+
 import numpy as np
 import torch
 from flashinfer import (
@@ -279,6 +281,107 @@ def trtllm_prefill_attn_kvfp8_dequant(
     return mock_kv_cache, mock_block_table
 
 
+class BatchDDTreeSplitPrefillWrapper:
+    """트리 어텐션을 '과거(마스크 없음) + 현재끼리(q x q 마스크)' 로 쪼갠다.
+
+    구조는 BatchDCPPrefillWrapper 와 같다 — 페이지드 컨텍스트 + ragged 신규토큰
+    + merge_attn_states. 다른 점은 신규토큰 쪽이 causal 이 아니라 트리 가시성
+    마스크를 쓴다는 것뿐이다.
+
+    🔴 컨텍스트 래퍼의 kv 길이는 현재 쿼리 토큰을 **빼야** 한다. 안 빼면 현재
+       토큰이 양쪽에서 두 번 셈해진다 (그리고 컨텍스트 쪽은 마스크가 없으므로
+       형제 노드가 서로를 보게 된다 — 무손실이 조용히 깨진다).
+    """
+
+    def __init__(self, kv_layout: str, workspace_buffer: torch.Tensor | None = None):
+        self._context = BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
+        self._local = BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer)
+
+    def plan(
+        self,
+        *,
+        qo_indptr_cpu: torch.Tensor,
+        ctx_kv_indptr: torch.Tensor,
+        ctx_kv_indices: torch.Tensor,
+        ctx_last_page_len: torch.Tensor,
+        local_mask: torch.Tensor,
+        page_size: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        sm_scale: float,
+        window_left: int,
+        logits_soft_cap: float | None,
+        q_data_type: torch.dtype,
+        kv_cache_dtype: torch.dtype,
+        prefill_fixed_split_size: int,
+        disable_split_kv: bool,
+    ):
+        self._context.plan(
+            qo_indptr=qo_indptr_cpu,
+            paged_kv_indptr=ctx_kv_indptr,
+            paged_kv_indices=ctx_kv_indices,
+            paged_kv_last_page_len=ctx_last_page_len,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            page_size=page_size,
+            causal=False,           # 과거는 전부 보인다 — 마스크가 필요 없다
+            sm_scale=sm_scale,
+            window_left=window_left,
+            logits_soft_cap=logits_soft_cap,
+            q_data_type=q_data_type,
+            kv_data_type=kv_cache_dtype,
+            fixed_split_size=prefill_fixed_split_size,
+            disable_split_kv=disable_split_kv,
+        )
+        # segment_packbits 가 CUDA indptr 을 요구한다 (기존 경로와 같은 제약)
+        _qo_dev = qo_indptr_cpu.to(local_mask.device)
+        self._local.plan(
+            qo_indptr=_qo_dev,
+            kv_indptr=_qo_dev,      # kv = 현재 토큰 자신
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            custom_mask=local_mask,
+            causal=False,           # 마스크가 가시성을 전부 규정한다
+            sm_scale=sm_scale,
+            window_left=window_left,
+            logits_soft_cap=logits_soft_cap,
+            q_data_type=q_data_type,
+        )
+
+    def run(self, layer, prefill_query, kv_cache_tuple, key, value, out):
+        o_ctx, lse_ctx = self._context.run(
+            prefill_query,
+            kv_cache_tuple,
+            k_scale=layer._k_scale_float,
+            v_scale=layer._v_scale_float,
+            return_lse=True,
+        )
+        o_loc, lse_loc = self._local.run(
+            prefill_query, key, value, return_lse=True
+        )
+        # 🔴 병합은 **어텐션 계층마다** 돈다. 8B 면 36번이라 고정비가 그대로 36배다.
+        #    vLLM 의 merge_attn_states 를 쓰면 LSE 를 전치 -> contiguous 복사 ->
+        #    log2에서 ln 변환까지 양쪽에 해야 해서 계층당 커널이 6개 더 붙는다.
+        #    FlashInfer 의 merge_state 는 래퍼가 그대로 내놓는 layout·log2 도메인을
+        #    받으므로 변환이 하나도 없다.
+        if _FI_MERGE_STATE is not None:
+            _v, _ = _FI_MERGE_STATE(o_ctx, lse_ctx, o_loc, lse_loc)
+            out.copy_(_v)
+        else:
+            merge_attn_states(
+                out,
+                o_ctx,
+                log2_lse_to_ln(lse_ctx.transpose(0, 1).contiguous()),
+                o_loc,
+                log2_lse_to_ln(lse_loc.transpose(0, 1).contiguous()),
+            )
+        return out
+
+
 class BatchDCPPrefillWrapper:
     def __init__(
         self,
@@ -406,6 +509,36 @@ class BatchDCPPrefillWrapper:
 #    segment_packbits 가 CUDA indptr 을 요구합니다 (CPU 면 RuntimeError).
 # --------------------------------------------------------------------------
 _DDTREE_MASK_PROVIDER = None
+_DDTREE_LOCAL_MASK_PROVIDER = None
+# 기본은 꺼둔다 — 켤 때만 2분할 경로를 탄다
+_DDTREE_SPLIT_ENABLED = os.environ.get("VLLM_DDTREE_SPLIT") == "1"
+try:                       # 없으면 vLLM 의 merge_attn_states 로 물러선다
+    from flashinfer import merge_state as _FI_MERGE_STATE
+except Exception:
+    _FI_MERGE_STATE = None
+if os.environ.get("VLLM_DDTREE_SPLIT_MERGE") == "vllm":
+    _FI_MERGE_STATE = None
+
+
+def set_ddtree_local_mask_provider(fn) -> None:
+    """fn(qo_indptr_cpu) -> 1D bool CUDA 텐서 | None  (세그먼트별 q x q 를 이어붙인 것)
+
+    🔴 마스크 2분할용. 기존 공급자는 q x (과거 + q) 를 통째로 만드는데, 트리
+       구조가 규정하는 건 마지막 q x q 블록뿐이고 과거 구간은 전부 1이다.
+       그런데 FlashInfer 의 custom_mask 커널은 그걸 다 읽으므로 **마스크 값이
+       문맥 길이에 비례**한다.
+
+       실측 (2026-09-01, 8B, 쿼리 폭 17 고정, 문맥만 프롬프트로 바꿈):
+           문맥 ~40   마스크 비용 0.65 ms/스텝
+           문맥 ~740  마스크 비용 4.43 ms/스텝
+       100토큰당 약 0.54 ms. 문맥 2000 이면 ~11 ms 로 DDTree 가 성립하지 않는다.
+
+       그래서 어텐션을 둘로 쪼갠다 — 과거는 마스크 없이 페이지드 경로로, 현재
+       토큰끼리는 q x q 마스크로 ragged 경로로 돌리고 log-sum-exp 로 병합한다.
+       그러면 마스크 값이 O(q x 문맥) 에서 O(q^2) 로 떨어진다.
+    """
+    global _DDTREE_LOCAL_MASK_PROVIDER
+    _DDTREE_LOCAL_MASK_PROVIDER = fn
 
 
 def set_ddtree_mask_provider(fn) -> None:
@@ -416,6 +549,44 @@ def set_ddtree_mask_provider(fn) -> None:
     """
     global _DDTREE_MASK_PROVIDER
     _DDTREE_MASK_PROVIDER = fn
+
+
+def _ddtree_split_plan(qo_indptr_cpu, paged_kv_indptr_cpu, last_page_len_cpu,
+                       paged_kv_indices, page_size):
+    """2분할용 컨텍스트 페이지 배열을 만든다 — 현재 쿼리 토큰을 뺀 길이로.
+
+    반환 (ctx_indptr, ctx_indices, ctx_last_page_len) 또는 None.
+    None 이면 이번 스텝은 2분할을 쓰지 않는다 (기존 단일 경로로 물러선다).
+
+    🔴 과거 길이가 0 인 세그먼트가 하나라도 있으면 포기한다. 진짜 prefill 이
+       섞인 배치인데, 빈 kv 를 페이지드 래퍼에 넘기는 건 안전하지 않다.
+    """
+    if _DDTREE_LOCAL_MASK_PROVIDER is None:
+        return None
+    npg = paged_kv_indptr_cpu[1:] - paged_kv_indptr_cpu[:-1]
+    kv_lens = (npg - 1) * page_size + last_page_len_cpu
+    q_lens = qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]
+    past = kv_lens - q_lens
+    if int(past.min()) <= 0:
+        return None
+    ctx_npg = (past + page_size - 1) // page_size
+    ctx_last = past - (ctx_npg - 1) * page_size
+    ctx_indptr = torch.zeros_like(paged_kv_indptr_cpu)
+    torch.cumsum(ctx_npg, 0, out=ctx_indptr[1:])
+    # 각 요청의 앞쪽 ctx_npg 개 페이지만 남긴다 (페이지 id 는 그대로다)
+    keep = torch.cat([
+        torch.arange(int(paged_kv_indptr_cpu[i]),
+                     int(paged_kv_indptr_cpu[i]) + int(ctx_npg[i]))
+        for i in range(len(ctx_npg))
+    ]) if len(ctx_npg) else torch.empty(0, dtype=torch.long)
+    return ctx_indptr, paged_kv_indices[keep.to(paged_kv_indices.device)], ctx_last
+
+
+def _ddtree_build_local_mask(qo_indptr_cpu):
+    """세그먼트별 q x q 마스크. 없으면 None."""
+    if _DDTREE_LOCAL_MASK_PROVIDER is None:
+        return None
+    return _DDTREE_LOCAL_MASK_PROVIDER(qo_indptr_cpu)
 
 
 def _ddtree_build_mask(qo_indptr_cpu, paged_kv_indptr_cpu, last_page_len_cpu, page_size):
@@ -707,6 +878,7 @@ class FlashInferMetadata:
 
     # --- DDTree ---
     ddtree_mask_active: bool = False
+    ddtree_split_active: bool = False
     """이번 스텝의 prefill plan() 이 트리 마스크로 계획되었는지.
     True 면 wrapper._causal 은 False 이고 가시성은 마스크가 규정한다."""
 
@@ -1161,6 +1333,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         return _make_xqa_ragged_draft_block_mask(
             ragged_q_lens, q_len_per_req, causal, self.device
         )
+
+    def _get_ddtree_split_wrapper(self) -> BatchDDTreeSplitPrefillWrapper:
+        if getattr(self, "_ddtree_split_wrapper", None) is None:
+            self._ddtree_split_wrapper = BatchDDTreeSplitPrefillWrapper(
+                get_flashinfer_layout_string(self.kv_cache_layout),
+                self._get_workspace_buffer(),
+            )
+        return self._ddtree_split_wrapper
 
     def _get_prefill_wrapper(
         self,
@@ -1658,47 +1838,89 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_dtype = (
                         FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
                     )
-                    # --- DDTree: 트리 마스크가 있으면 custom_mask 로 전달 ---
-                    ddtree_mask = _ddtree_build_mask(
-                        qo_indptr_prefill_cpu,
-                        paged_kv_indptr_prefill_cpu,
-                        paged_kv_last_page_len_prefill_cpu,
-                        self.page_size,
-                    )
-                    if ddtree_mask is None:
-                        _qo_ind = qo_indptr_prefill_cpu
-                        _kv_ind = paged_kv_indptr_prefill_cpu
-                        _lpl = paged_kv_last_page_len_prefill_cpu
-                        _causal = attn_metadata.causal
+                    # --- DDTree: 마스크 2분할 경로 (VLLM_DDTREE_SPLIT=1) ---
+                    #     과거는 마스크 없이, 현재 토큰끼리만 q x q 마스크로.
+                    #     🔴 기본은 꺼져 있다 — 실측에서 모든 문맥 길이에서 진다(§37).
+                    _split = None
+                    if _DDTREE_SPLIT_ENABLED:
+                        _lm = _ddtree_build_local_mask(qo_indptr_prefill_cpu)
+                        if _lm is not None:
+                            _split = _ddtree_split_plan(
+                                qo_indptr_prefill_cpu,
+                                paged_kv_indptr_prefill_cpu,
+                                paged_kv_last_page_len_prefill_cpu,
+                                paged_kv_indices,
+                                self.page_size,
+                            )
+                    if _split is not None:
+                        _ctx_indptr, _ctx_indices, _ctx_last = _split
+                        _sw = self._get_ddtree_split_wrapper()
+                        _sw.plan(
+                            qo_indptr_cpu=qo_indptr_prefill_cpu,
+                            ctx_kv_indptr=_ctx_indptr,
+                            ctx_kv_indices=_ctx_indices,
+                            ctx_last_page_len=_ctx_last,
+                            local_mask=_lm,
+                            page_size=self.page_size,
+                            num_qo_heads=self.num_qo_heads,
+                            num_kv_heads=self.num_kv_heads,
+                            head_dim=self.head_dim,
+                            sm_scale=self.sm_scale,
+                            window_left=self.window_left,
+                            logits_soft_cap=self.logits_soft_cap,
+                            q_data_type=self.q_data_type_prefill,
+                            kv_cache_dtype=self.kv_cache_dtype,
+                            prefill_fixed_split_size=self.prefill_fixed_split_size,
+                            disable_split_kv=self.disable_split_kv,
+                        )
+                        attn_metadata.ddtree_mask_active = True
+                        attn_metadata.ddtree_split_active = True
+                        # 🔴 조기 return 은 안 된다 — 아래 디코드 경로가 남아 있다.
+                        #    공용 FIPrefill(wrapper=prefill_wrapper) 가 집도록
+                        #    참조만 갈아끼운다.
+                        prefill_wrapper = _sw
                     else:
-                        # segment_packbits 는 CUDA indptr 을 요구한다
-                        _dev = paged_kv_indices.device
-                        _qo_ind = qo_indptr_prefill_cpu.to(_dev)
-                        _kv_ind = paged_kv_indptr_prefill_cpu.to(_dev)
-                        _lpl = paged_kv_last_page_len_prefill_cpu.to(_dev)
-                        # 마스크가 가시성을 전부 규정하므로 causal 은 끈다
-                        _causal = False
-                    prefill_wrapper.plan(
-                        qo_indptr=_qo_ind,
-                        paged_kv_indptr=_kv_ind,
-                        paged_kv_indices=paged_kv_indices,
-                        paged_kv_last_page_len=_lpl,
-                        custom_mask=ddtree_mask,
-                        num_qo_heads=self.num_qo_heads,
-                        num_kv_heads=self.num_kv_heads,
-                        head_dim_qk=self.head_dim,
-                        page_size=self.page_size,
-                        causal=_causal,
-                        sm_scale=self.sm_scale,
-                        window_left=self.window_left,
-                        logits_soft_cap=self.logits_soft_cap,
-                        q_data_type=self.q_data_type_prefill,
-                        kv_data_type=self.kv_cache_dtype,
-                        o_data_type=o_dtype,
-                        fixed_split_size=self.prefill_fixed_split_size,
-                        disable_split_kv=self.disable_split_kv,
-                    )
-                    attn_metadata.ddtree_mask_active = ddtree_mask is not None
+                      # --- DDTree: 트리 마스크가 있으면 custom_mask 로 전달 ---
+                      ddtree_mask = _ddtree_build_mask(
+                          qo_indptr_prefill_cpu,
+                          paged_kv_indptr_prefill_cpu,
+                          paged_kv_last_page_len_prefill_cpu,
+                          self.page_size,
+                      )
+                      if ddtree_mask is None:
+                          _qo_ind = qo_indptr_prefill_cpu
+                          _kv_ind = paged_kv_indptr_prefill_cpu
+                          _lpl = paged_kv_last_page_len_prefill_cpu
+                          _causal = attn_metadata.causal
+                      else:
+                          # segment_packbits 는 CUDA indptr 을 요구한다
+                          _dev = paged_kv_indices.device
+                          _qo_ind = qo_indptr_prefill_cpu.to(_dev)
+                          _kv_ind = paged_kv_indptr_prefill_cpu.to(_dev)
+                          _lpl = paged_kv_last_page_len_prefill_cpu.to(_dev)
+                          # 마스크가 가시성을 전부 규정하므로 causal 은 끈다
+                          _causal = False
+                      prefill_wrapper.plan(
+                          qo_indptr=_qo_ind,
+                          paged_kv_indptr=_kv_ind,
+                          paged_kv_indices=paged_kv_indices,
+                          paged_kv_last_page_len=_lpl,
+                          custom_mask=ddtree_mask,
+                          num_qo_heads=self.num_qo_heads,
+                          num_kv_heads=self.num_kv_heads,
+                          head_dim_qk=self.head_dim,
+                          page_size=self.page_size,
+                          causal=_causal,
+                          sm_scale=self.sm_scale,
+                          window_left=self.window_left,
+                          logits_soft_cap=self.logits_soft_cap,
+                          q_data_type=self.q_data_type_prefill,
+                          kv_data_type=self.kv_cache_dtype,
+                          o_data_type=o_dtype,
+                          fixed_split_size=self.prefill_fixed_split_size,
+                          disable_split_kv=self.disable_split_kv,
+                      )
+                      attn_metadata.ddtree_mask_active = ddtree_mask is not None
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
         ## DECODE PATHWAY
@@ -2168,7 +2390,19 @@ class FlashInferImpl(AttentionImpl):
                 assert isinstance(attn_metadata.prefill, FIPrefill)
                 prefill_wrapper = attn_metadata.prefill.wrapper
                 assert prefill_wrapper is not None
-                if use_dcp:
+                if attn_metadata.ddtree_split_active:
+                    # DDTree 2분할: 과거(페이지드, 마스크 없음) + 현재끼리
+                    # (ragged, q x q 마스크) 를 log-sum-exp 로 병합한다.
+                    assert isinstance(prefill_wrapper, BatchDDTreeSplitPrefillWrapper)
+                    prefill_wrapper.run(
+                        layer,
+                        prefill_query,
+                        kv_cache_tuple,
+                        key[num_decode_tokens:],
+                        value[num_decode_tokens:],
+                        out=output[num_decode_tokens:],
+                    )
+                elif use_dcp:
                     assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
                     assert prefill_wrapper._context._window_left == self.window_left
                     assert prefill_wrapper._context._logits_soft_cap == (

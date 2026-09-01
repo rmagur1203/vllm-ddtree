@@ -108,6 +108,7 @@ class DDTreeRuntime:
                       "tree_underfilled": 0, "compact_unsafe": 0,
                       # 퇴화 빠른 경로가 얼마나 걸리는지
                       "c_skip": 0, "c_work": 0,
+                      "local_mask": 0,
                       # ngram 경로가 트리를 못 만든 이유를 가른다 (§25)
                       "ng_nomatch": 0, "ng_underfill": 0, "ng_ok": 0,
                       # 요청별 드래프트 길이 분포 — 갈리는지 확인용
@@ -453,6 +454,48 @@ class DDTreeRuntime:
             parts.append(torch.from_numpy(m.reshape(-1)))
         _r = torch.cat(parts).to(self.device)
         self.t["mask"] += time.perf_counter() - _t0
+        return _r
+
+    def local_mask_provider(self, qo_indptr_cpu):
+        """마스크 2분할용 — 세그먼트별 q x q 만 만든다 (과거 구간은 안 만든다).
+
+        기존 mask_provider 는 q x (과거 + q) 를 통째로 만들고 그 중 과거 부분은
+        전부 1이다. FlashInfer 의 custom_mask 커널이 그걸 다 읽으므로 마스크 값이
+        문맥 길이에 비례한다 (실측: 문맥 40 에서 0.65 ms, 740 에서 4.43 ms).
+        여기서는 트리가 실제로 규정하는 q x q 만 준다 — 문맥과 무관하다.
+
+        🔴 짝짓기 근거가 폭 하나뿐이다. kv_len 은 못 쓴다 (낙관적 값이라 안 맞는다,
+           mask_provider 의 주석 참고). 트리 폭인 세그먼트 수가 이번 스텝의 트리
+           수와 정확히 같을 때만 짝짓고, 아니면 None 을 반환해 단일 경로로
+           물러선다 — 무손실 우선이다.
+        🔴 드래프터 forward 중에는 절대 주면 안 된다 (mask_provider 와 같은 이유).
+        """
+        if not self.step or self.no_mask or self.in_drafter:
+            return None
+        _t0 = time.perf_counter()
+        qs = qo_indptr_cpu.tolist()
+        widths = {t.num_nodes for _, t in self.step}
+        tree_segs = [j for j in range(len(qs) - 1) if (qs[j + 1] - qs[j]) in widths]
+        if len(tree_segs) != len(self.step):
+            if tree_segs:
+                self.stats["ambiguous"] += 1
+            return None
+        pairing = {j: t for j, (_, t) in zip(tree_segs, self.step)}
+        parts = []
+        for j in range(len(qs) - 1):
+            q = qs[j + 1] - qs[j]
+            tree = pairing.get(j)
+            if tree is not None and tree.num_nodes == q:
+                m = tree.visibility
+                self.masked_trees.add(id(tree))
+                self.stats["masked"] += 1
+            else:
+                # 트리가 아닌 세그먼트(진짜 prefill 등)는 자기들끼리 causal
+                m = np.tril(np.ones((q, q), dtype=np.bool_))
+            parts.append(torch.from_numpy(np.ascontiguousarray(m).reshape(-1)))
+        _r = torch.cat(parts).to(self.device)
+        self.t["mask"] += time.perf_counter() - _t0
+        self.stats["local_mask"] += 1
         return _r
 
     # ---- GDN(재귀 계층)용 ----
