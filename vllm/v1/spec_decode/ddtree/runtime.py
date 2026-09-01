@@ -47,7 +47,15 @@ class DDTreeRuntime:
         self.topk_cap = int(_os.environ.get("VLLM_DDTREE_TOPK", topk_cap))
         self.compact_impl = _os.environ.get("VLLM_DDTREE_COMPACT", "triton")
         self.spine = _os.environ.get("VLLM_DDTREE_SPINE") == "1"
+        # 적응형 폭. best-first 의 가중치는 노드가 수용 경로에 놓일 확률의
+        # 추정인데, 실측하면 깊이 방향으로 과대·rank 방향으로 과소평가된다.
+        # log(실제/추정) 이 둘 다 거의 선형이라 상수 두 개로 보정한다:
+        #   BETA(β)  깊이마다 lp 에 더한다 — 음수면 깊은 척추를 깎는다
+        #   RANKB(δ) 형제로 갈 때마다 가중치에 더한다 — 양수면 가지를 연다
+        # 고정 폭이 아니라 보정된 가중치끼리 겨루므로, 드래프터가 확신하는
+        # 자리에서는 깊이가 이기고 헷갈리는 자리에서만 가지가 열린다.
         self.depth_bonus = float(_os.environ.get("VLLM_DDTREE_BETA", "0"))
+        self.rank_bonus = float(_os.environ.get("VLLM_DDTREE_RANKB", "0"))
         _tau = _os.environ.get("VLLM_DDTREE_TAU")
         self.dynamic_tau = float(_tau) if _tau else None
         # 확신 시 예산 전부를 깊이에 쏟는다. 트리가 예산보다 짧아질 수 있어
@@ -138,7 +146,8 @@ class DDTreeRuntime:
             _short = self.true_chain and self.dynamic_tau is not None
             tree = shape_and_build(
                 lp, ids, self.budget, topk=self.topk_cap, spine=self.spine,
-                depth_bonus=self.depth_bonus, dynamic_tau=self.dynamic_tau,
+                depth_bonus=self.depth_bonus, rank_bonus=self.rank_bonus,
+                dynamic_tau=self.dynamic_tau,
                 allow_short=_short, pad_to_budget=not _short,
             )
             _n = tree.num_nodes - 1
@@ -204,6 +213,7 @@ class DDTreeRuntime:
             tree = shape_and_build(
                 lp_all[i], ids_all[i], self.budget, topk=_topk,
                 spine=self.spine, depth_bonus=self.depth_bonus,
+                rank_bonus=self.rank_bonus,
                 dynamic_tau=self.dynamic_tau, allow_short=_short_ok,
                 # 🔴 여기서 끄면 안 된다. 진짜 사슬로 갈지는 shape_and_build 가
                 #    스텝마다 판단하고, 트리로 남으면 패딩이 있어야 폭이 맞는다.

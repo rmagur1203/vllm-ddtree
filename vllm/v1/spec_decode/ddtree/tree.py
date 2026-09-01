@@ -60,8 +60,27 @@ def build_tree(
     top_token_ids: np.ndarray,   # [depth_limit, topk]
     budget: int,
     spine: bool = False,
+    rank_bonus: float = 0.0,
 ) -> Tree:
     """best-first 힙으로 노드 예산만큼 트리를 넓힌다.
+
+    rank_bonus(δ)는 '적응형 폭' 의 핵심이다. best-first 의 가중치는 노드가 수용
+    경로에 놓일 확률의 **추정치**인데, 실측하면 그 추정이 깊이·rank 방향으로
+    구조적으로 치우쳐 있다. 실제/추정 비를 C 라 하면 (8B+EAGLE3+예산5, 모양을
+    강제해 선택 편향을 없앤 측정):
+
+        깊이 1..5 의 rank0:  0.85  0.66  0.26  0.20  0.06
+        깊이 1 의 rank0/1/2: 0.85  0.96  1.69
+
+    즉 **깊은 척추는 크게 과대평가, 형제는 과소평가**된다. log C 가 깊이에 거의
+    선형(기울기 -0.65)이고 rank 에도 선형(+0.3)이라, 노드 가중치에
+    `depth_bonus*깊이 + rank_bonus*rank` 를 더하면 그대로 보정된다. depth_bonus 는
+    lp 에 상수를 더해 이미 처리되므로(shape_and_build) 여기서는 rank 쪽만
+    형제를 밀어 넣을 때 누적한다.
+
+    폭이 고정 값으로 정해지지 않는 것이 핵심이다 — 보정된 가중치끼리 겨루므로
+    드래프터가 확신하는 자리에서는 깊이가 이기고 헷갈리는 자리에서만 가지가
+    열린다. 그게 '적응형' 의 의미다.
 
     가중치는 루트에서 그 노드까지의 누적 log-prob 이다. 매번 꺼낼 때마다
       - 형제(같은 깊이, rank+1)
@@ -110,7 +129,7 @@ def build_tree(
             child_maps[parent_index][token_id] = cur
             n += 1
             if topk > 1:
-                w = logw - lp + float(top_log_probs[d - 1, 1])
+                w = logw - lp + float(top_log_probs[d - 1, 1]) + rank_bonus
                 heapq.heappush(
                     heap, (-w, (0,) * (d - 1) + (1,), parent_index, d, 1, w))
             parent_index = cur
@@ -135,7 +154,7 @@ def build_tree(
         if rank + 1 < topk:                       # 형제
             w = logw - float(top_log_probs[depth - 1, rank]) + float(
                 top_log_probs[depth - 1, rank + 1]
-            )
+            ) + rank_bonus
             heapq.heappush(heap, (-w, ranks[:-1] + (rank + 1,), parent_index, depth, rank + 1, w))
 
         if depth < depth_limit:                   # 자식
@@ -211,7 +230,8 @@ def build_tree_from_logits(draft_logits: torch.Tensor, budget: int,
                           spine: bool = False,
                           depth_bonus: float = 0.0,
                           dynamic_tau: float | None = None,
-                          allow_short: bool = False) -> Tree:
+                          allow_short: bool = False,
+                          rank_bonus: float = 0.0) -> Tree:
     """드래프터 logits [depth_limit, vocab] → Tree. topk/정규화는 GPU 에서.
 
     topk_cap=1 이면 분기가 없는 순수 사슬이 된다 (이분법용).
@@ -220,13 +240,14 @@ def build_tree_from_logits(draft_logits: torch.Tensor, budget: int,
     lp, ids, topk = topk_from_logits(draft_logits, budget, topk_cap)
     return shape_and_build(lp, ids, budget, topk=topk, spine=spine,
                            depth_bonus=depth_bonus, dynamic_tau=dynamic_tau,
-                           allow_short=allow_short, pad_to_budget=pad_to_budget)
+                           allow_short=allow_short, pad_to_budget=pad_to_budget,
+                           rank_bonus=rank_bonus)
 
 
 def shape_and_build(lp: np.ndarray, ids: np.ndarray, budget: int, *,
                     topk: int, spine: bool = False, depth_bonus: float = 0.0,
                     dynamic_tau: float | None = None, allow_short: bool = False,
-                    pad_to_budget: bool = True) -> Tree:
+                    pad_to_budget: bool = True, rank_bonus: float = 0.0) -> Tree:
     """모양 결정 + 트리 생성. DFlash 경로와 ngram 경로가 함께 쓴다.
 
     🔴 예전에는 이 로직이 build_tree_from_logits 안에만 있어서 ngram 경로
@@ -257,7 +278,8 @@ def shape_and_build(lp: np.ndarray, ids: np.ndarray, budget: int, *,
         #    그대로다. 깊이 d 노드가 얕은 형제 대비 depth_bonus*(d-1) 이득을
         #    보려면 '더해야' 한다. 같은 깊이 형제끼리는 상수가 상쇄된다.
         lp = lp + depth_bonus
-    tree = build_tree(lp[:, :topk], ids[:, :topk], budget, spine=spine)
+    tree = build_tree(lp[:, :topk], ids[:, :topk], budget, spine=spine,
+                      rank_bonus=rank_bonus)
     tree.lp_top = (lp[:, : min(2, lp.shape[1])] - depth_bonus).tolist()
     if depth_bonus and tree.node_lp is not None:
         # 보정 측정은 '드래프터가 말한 값' 을 봐야 하므로 보정분을 되돌린다.
