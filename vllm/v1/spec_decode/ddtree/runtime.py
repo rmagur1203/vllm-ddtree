@@ -127,7 +127,10 @@ class DDTreeRuntime:
                   "p_topk": 0.0, "p_build": 0.0, "p_out": 0.0, "p_wait": 0.0,
                   "a_wait": 0.0, "a_meta": 0.0, "a_argmax": 0.0,
                   "a_loop": 0.0, "a_out": 0.0,
-                  "c_idx": 0.0, "c_viol": 0.0, "c_kernel": 0.0}
+                  "c_idx": 0.0, "c_viol": 0.0, "c_kernel": 0.0,
+                  # 🔴 구간별 '앞선 GPU 작업 대기'. time_split 을 켜야 채워진다.
+                  #    이게 없으면 구간 시간에 대기가 섞여 CPU 값을 통째로 오독한다.
+                  "m_wait": 0.0, "r_wait": 0.0, "c_wait": 0.0}
         global LAST
         LAST = self
 
@@ -368,6 +371,9 @@ class DDTreeRuntime:
         if not self.step:
             return None
         if self._rope is None:
+            if self.time_split:
+                _tw = time.perf_counter(); torch.cuda.synchronize()
+                self.t["r_wait"] += time.perf_counter() - _tw
             _t0 = time.perf_counter()
             active = [(i, t) for i, t in self.step if id(t) in self.masked_trees]
             self.stats["rope_skipped"] += len(self.step) - len(active)
@@ -415,6 +421,9 @@ class DDTreeRuntime:
         #    (실측 2026-08-27: 예산 7 + 분기 → 출력 깨짐, 사슬은 무해해서 안 드러남)
         if not self.step or self.no_mask or self.in_drafter:
             return None
+        if self.time_split:
+            _tw = time.perf_counter(); torch.cuda.synchronize()
+            self.t["m_wait"] += time.perf_counter() - _tw
         _t0 = time.perf_counter()
         qs = qo_indptr_cpu.tolist()
         kvs = [int(x) for x in kv_lens_cpu.tolist()]
@@ -709,6 +718,9 @@ class DDTreeRuntime:
             self.stats["gdn_compact_err"] = repr(_e)[:80]
         self.t["gdn_compact"] += time.perf_counter() - _t0
 
+        if self.time_split:
+            _tw = time.perf_counter(); torch.cuda.synchronize()
+            self.t["c_wait"] += time.perf_counter() - _tw
         _t0 = time.perf_counter()
         if not paths:
             return
