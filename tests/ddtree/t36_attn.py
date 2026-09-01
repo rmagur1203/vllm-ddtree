@@ -98,6 +98,13 @@ HARD = [
 ]
 HARD_NAMES = ["소설", "설명", "코드2", "사실", "번역", "나열"]
 
+# 🔴 문맥 길이를 실험 변수로 쓰려면 **프롬프트로** 늘려야 한다. 생성으로 늘리면
+#    수용률이 다른 팔끼리 문맥이 달라져 비교가 오염된다 (수용이 무너지면 같은
+#    스텝 수에서 문맥이 짧다).
+_ctx = int(os.environ.get("DDT_CTX", "0"))
+_FILL = ("The archive room held ledgers no one had opened in decades, each page "
+         "recording a transaction whose parties were long gone. ")
+
 _set = os.environ.get("DDT_SET", "easy")
 if _set == "hard":
     PROMPTS, NAMES = HARD, HARD_NAMES
@@ -105,6 +112,9 @@ elif _set == "both":
     PROMPTS, NAMES = EASY + HARD, EASY_NAMES + HARD_NAMES
 else:
     PROMPTS, NAMES = EASY, EASY_NAMES
+if _ctx:
+    _pad = _FILL * (_ctx // 20 + 1)      # 대략 문장당 20토큰
+    PROMPTS = [_pad + p for p in PROMPTS]
 _only = os.environ.get("DDT_ONLY")
 if _only is not None:            # 노드 문맥 검증은 프롬프트 하나로 해야 정렬이 선다
     _i = [int(c) for c in _only]
@@ -113,13 +123,13 @@ if _only is not None:            # 노드 문맥 검증은 프롬프트 하나�
 
 kw = dict(
     model=_MODELS[ARCH],
-    max_model_len=1024,
+    max_model_len=int(os.environ.get("DDT_MAXLEN", "1024")),
     attention_backend="FLASHINFER",
     gpu_memory_utilization=float(os.environ.get("DDT_UTIL", "0.20")),
     enforce_eager=EAGER,
     enable_prefix_caching=False,
     max_num_seqs=4,
-    max_num_batched_tokens=1024,
+    max_num_batched_tokens=int(os.environ.get("DDT_MAXLEN", "1024")),
 )
 if ARCH == "hybrid":
     kw["mamba_cache_mode"] = "align"
