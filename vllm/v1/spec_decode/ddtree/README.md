@@ -10,55 +10,88 @@ DDTree (Diffusion Draft Tree, arXiv:2604.12989) 를 vLLM 에 구현한 것.
 
     vLLM 0.26.1rc1.dev1177+ga9a17e709   (도커 이미지 vllm/vllm-openai:nightly)
 
-`patches/*.patch` 는 **이 커밋의 파일에 대한 차분**이다. 다른 리비전에 올릴 때는
-재생성해야 한다. 원본은 이미지에서 뽑았다:
+## 구성 — 무엇이 어디에 있나
+
+이 리포(브랜치 `ddtree-multireq`)가 **정본**이고, 변경은 파일 제자리에 들어가 있다.
+
+    vllm/v1/spec_decode/ddtree/   트리 빌드·런타임·KV 압축·GDN 트리 헬퍼 (새 패키지)
+    csrc/ddtree/                  GDN 트리 CUDA 커널
+    tools/ddtree_patch_v2_*.py    V2 러너·speculator 에 훅을 얹는 패치 스크립트
+    tests/ddtree/                 검증 스크립트
+    docs/DDTREE-SCOPING.md        실험 기록 전체 (결론과 철회 목록은 맨 앞)
+
+기존 vLLM 파일 중 고친 것:
+
+| 파일 | 내용 |
+|---|---|
+| `v1/attention/backends/flashinfer.py` | prefill `plan()` 에 `custom_mask` 전달, 마스크 공급자 등록 |
+| `v1/worker/gpu_model_runner.py` | 훅 6곳 — 초기화·스텝 시작·RoPE 치환·수용/압축·propose 가로채기 |
+| `v1/spec_decode/dflash.py` | `drafter_k` 를 체크포인트 `block_size-1` 에서 읽음 |
+| `v1/spec_decode/llm_base_proposer.py` | 드래프터 logits 를 트리 빌드용으로 보관 |
+| `model_executor/models/qwen3_dflash2.py` | conv `block_size` 를 체크포인트에서 읽음 |
+| `.../mamba/gdn/qwen_gdn_linear_attn.py` | GDN 트리 경로 연결, 8토큰 상한 해제 |
+| `.../ops/fused_sigmoid_gating.py` | Triton SSM 에 `tree_parent_indices` |
+| `.../mamba/ops/causal_conv1d.py` | conv **update** 커널이 조상 열에서 윈도를 읽게 수정 |
+
+### 🔴 V1 정본과 V2 실행본은 갈라져 있다
+
+리포의 `ddtree/` 패키지는 **V1 러너용**이다 — 요청별 가변 드래프트 길이
+(`draft_lens`, `cols_from_parents`)가 들어 있고 그걸 `gpu_model_runner.py` 가
+소비한다. 브랜치 이름이 `ddtree-multireq` 인 이유다.
+
+**§29 이후의 모든 성능 측정(§33~§50)은 V2 러너에서 나왔고**, 그 V2 실행본의
+`ddtree/` 패키지는 multireq 작업 **이전**에서 갈라진 사본이다. V2 패치 스크립트는
+`draft_lens` 를 다루지 않고 `gdn_info`/`tree_parents_tensor` 시그니처도 다르다.
+**리포본을 V2 마운트에 그대로 얹으면 안 된다** — 짧은 트리의 폭이 어긋난다.
+
+V2 러너·speculator 자체는 패치 스크립트로 **완전히 재현된다** (2026-09-02 확인,
+차이 0줄). 이미지에서 원본을 뽑아 돌리면 된다:
 
     cid=$(docker create vllm/vllm-openai:nightly)
-    docker cp "$cid:/usr/local/lib/python3.12/dist-packages/vllm/<경로>" .
+    docker cp "$cid:/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py" orig.py
+    python3 tools/ddtree_patch_v2_runner.py orig.py patched.py
 
-## 구성
+🔴 반드시 **컨테이너에서 뽑은 원본**에 적용할 것. 리포본은 리비전이 달라
+   앵커가 안 맞는다.
 
-    patches/    기존 vLLM 파일 8개에 대한 차분 (합계 ~1000줄)
-    new/        새로 추가하는 파일
-      vllm/v1/spec_decode/ddtree/   트리 빌드·런타임·KV 압축·GDN 트리 헬퍼
-      csrc/ddtree/                  GDN 트리 CUDA 커널 + JIT 로더
-    tests/      검증 스크립트
-
-### 패치별 요지
-
-| 패치 | 파일 | 내용 |
-|---|---|---|
-| 0001 | `v1/attention/backends/flashinfer.py` | prefill `plan()` 에 `custom_mask` 전달, 마스크 공급자 등록 |
-| 0002 | `v1/worker/gpu_model_runner.py` | 훅 6곳 — 초기화·스텝 시작·RoPE 치환·수용/압축·propose 가로채기 |
-| 0003 | `v1/spec_decode/dflash.py` | `drafter_k` 를 체크포인트 `block_size-1` 에서 읽음 |
-| 0004 | `v1/spec_decode/llm_base_proposer.py` | 드래프터 logits 를 트리 빌드용으로 보관 |
-| 0005 | `model_executor/models/qwen3_dflash2.py` | conv `block_size` 를 체크포인트에서 읽음 |
-| 0006 | `.../mamba/gdn/qwen_gdn_linear_attn.py` | GDN 트리 경로 연결, 8토큰 상한 해제 |
-| 0007 | `.../ops/fused_sigmoid_gating.py` | Triton SSM 에 `tree_parent_indices` |
-| 0008 | `.../mamba/ops/causal_conv1d.py` | conv **update** 커널이 조상 열에서 윈도를 읽게 수정 |
-
-## 🔴 판정 (2026-09-01) — 이기는 조합이 없다
+## 🔴 판정 (2026-09-02) — 이기는 조합이 없다
 
 측정을 끝까지 밀어붙인 결과다. 자세한 것은 `../../../../docs/DDTREE-SCOPING.md`
 맨 앞의 결론 절.
 
 | 조합 | DDTree 대 같은 예산의 사슬 |
 |---|---|
-| **27B GDN + DFlash2 (운영 설정)** | **0.62x** |
-| 4B GDN + DFlash | 0.68x |
-| 8B 순수 어텐션 + EAGLE3, 배치 1 | **1.00x (동률)** |
-| 8B 순수 어텐션 + EAGLE3, 배치 2 / 4 / 16 | 0.98x / 0.97x / 0.96x |
+| **27B GDN + DFlash2, T=0 (운영 모델)** | **0.78x** (§48) |
+| **27B GDN + DFlash2, 운영 샘플링 기본값** | **0.69x** (§50) |
+| 8B 순수 어텐션 + EAGLE3, 배치 1 | **1.00x (동률)** (§44) |
+| 8B 순수 어텐션 + EAGLE3, 배치 2 / 4 / 16 | 0.98x / 0.97x / 0.96x (§41) |
+| 4B GDN + DFlash | 0.68x — §47 수정 전 값, 재측정 안 함 |
 
-지는 이유가 세 가지 독립적으로 있다.
+운영 샘플링 기본값은 T=1.0 · top_k 20 · top_p 0.95 다 (모델 `generation_config.json`
+을 vLLM 이 요청 기본값으로 쓴다). 온도를 안 보내는 클라이언트는 전부 이 조건이다.
 
-1. **GDN 하이브리드는 구조적으로 불가.** 트리 GDN 커널이 계층수·은닉차원에
-   비례해 스텝 단가를 +44~49% 올린다. 모델을 키우면 더 커진다.
-2. **좋은 드래프터에서는 분기가 헛돈다.** DFlash2·EAGLE3 의 1위가 이미 충분히
-   맞아 2·3위 형제가 값을 못 한다. 드래프터 1위 적중률 33% 짜리 표본을 따로
-   만들어야 수용에서 이긴다(그래도 시간은 동률).
-3. **배치가 커지면 검증 폭이 공짜가 아니다.** "토큰당 0.18 ms" 는 배치 1 에서
-   GPU 가 놀기 때문이었다. 배치 16 이면 최적 예산이 16 → 4 로 줄어든다.
+지는 이유는 둘이다. **한때 셋이라고 적었는데 첫 번째는 철회됐다.**
+
+1. ~~**GDN 하이브리드는 구조적으로 불가.** 트리 GDN 커널이 스텝 단가를 +44~49%
+   올린다.~~ 🔴 **철회 (§46).** 측정이 아니라 추론이었다. 직접 재니 운영
+   동작점(T=8)에서 트리 커널은 스톡 커널보다 **1.2 µs/계층** 비쌀 뿐이다
+   (48계층 = 0.06 ms, 격차의 0.3%).
+   진짜 원인은 **CPU 트리 워크가 만드는 GPU 유휴**다 (§48). 사슬은 검증을 전부
+   GPU 에서 끝내 GPU 가 101% 바쁜데, DDTree 는 스텝마다 CPU 로 내려와
+   `follow_tree` 를 걷느라 GPU 가 90% 만 바쁘다 — 스텝당 4.9 ms 의 버블이다.
+2. **좋은 드래프터에서는 분기가 헛돈다.** 오라클 트리로 상한을 쟀다 (§50):
+   트리 쪽에 남은 수용은 **+3.5~4% 뿐이고 형제 둘에서 포화**한다. 척추가
+   틀리는 자리의 37% 는 rank-1 형제가 정답이라 형제 자리는 분명히 있는데,
+   **형제 뒤가 안 이어진다** — DFlash2 의 주변분포는 argmax 경로 조건부라
+   형제(rank-1) 뒤에서는 다음 깊이가 22% 만 맞는다 (척추는 65~84%).
+   그래서 형제는 잎 하나 값이고 형제의 자식은 거의 쓰레기다.
+3. **배치가 커지면 검증 폭이 공짜가 아니다** (§41). "토큰당 0.18 ms" 는 배치 1
+   에서 GPU 가 놀기 때문이었다. 배치 16 이면 최적 예산이 16 → 4 로 줄어든다.
    운영은 max-num-seqs 64 다.
+
+**기계값을 전부 없애고 GDN 커널을 T≤16 으로 넓히고 좁은 트리를 써도 0.94x** 다
+(§50-7). DFlash2 를 넘으려면 드래프터를 바꿔야 한다 — 형제 뒤 조건부 분포를
+내놓거나, 형제를 덜 과소평가하도록 재학습. **vLLM 통합 쪽에서 할 일은 끝났다.**
 
 아래 내용은 **구현이 무엇을 하는지의 기록**으로 남긴다.
 
@@ -69,24 +102,28 @@ DDTree (Diffusion Draft Tree, arXiv:2604.12989) 를 vLLM 에 구현한 것.
   - T=0 (greedy) 정확성 — 아래 §정확성 기준 참조. 기준은 'base 비트 일치' 가
     아니라 **'같은 조건의 사슬 스펙 디코딩과 동일'** 이다. base 비트 일치는
     사슬도 못 지킨다 (docs §33).
+  - **T>0 도 동작한다** (§45). 노드마다 타깃 분포에서 뽑고 그 토큰으로 트리를
+    내려간다 — 방출 열의 매 토큰이 그 위치의 p 에서 나온 표본이 된다.
+    T=0 에서는 기존과 바이트 동일이다 (gumbel 경로가 순수 argmax).
   - V1·V2 모델 러너 양쪽, TP=1·TP=2 양쪽에서 동작 (docs §43)
   - 트리 빌드가 참조 구현과 동일 (`tests/t4_tree_build.py`, 12/12)
   - 분기 노드의 로짓이 그 조상 경로를 단독 실행한 결과와 일치
     (`tests/t20_node_context.py`, 48/48)
   - GDN 트리 CUDA 커널: 임의 슬롯·accepted 1~33·T=96·분기 깊이 11 에서 오차 0
     (`tests/t18_branch.py`)
+  - KV 압축 커널이 순서를 전제하지 않는다 (`tests/t5_compact.py`, 9/9 + 포인터 메모)
 
 ## 🔴 업스트림 전에 반드시 해결할 것
 
 1. **정확성 기준을 모델 종류별로 나눠야 한다.** 아래 §정확성 기준 참조.
    커널 자체는 fp64 로 검증했고 결함이 없다 — 고칠 코드가 아니라 바꿀 기준이다.
-2. **디버그 발판 제거.** `VLLM_DDTREE_GDN_CHECK`(CUDA vs Triton 상태 교차검증),
-   `VLLM_DDTREE_TRACE`, `lp_top`/`dyn_mode`/`e_chain` 필드, 각종 통계 히스토그램.
+2. **디버그 발판 제거.** `VLLM_DDTREE_GDN_CHECK`, `VLLM_DDTREE_TRACE`(및 그것이
+   기록하는 `lp_top`/`ids_top`/`lp_top16`/`node_lp`/`node_rank`), `dyn_mode`,
+   `e_chain`, 통계 히스토그램, 그리고 측정용 격리 손잡이 전부
+   (`NOGDN`/`NOROPE`/`NOFAST`/`CCHECK`/`NOPTRMEMO`/`TIMESPLIT`/`CHAINMASK`).
    측정용이라 프로덕션 경로에 있으면 안 된다.
-3. **모듈 배치와 import.** 새 모듈들이 서로를 평면 이름으로 import 한다
-   (`from ddtree_tree import ...`). 패키지 상대 import 로 바꿔야 한다.
-   `gpu_model_runner` 패치와 `qwen_gdn_linear_attn` 패치가 `/work`, `/work/cuda`
-   를 `sys.path` 에 넣는 부분도 제거 대상이다.
+3. **모듈 배치와 import.** `gpu_model_runner` 패치와 `qwen_gdn_linear_attn` 패치가
+   `/work`, `/work/cuda` 를 `sys.path` 에 넣는 부분은 제거 대상이다.
 4. **CUDA 커널 빌드.** 지금은 `torch.utils.cpp_extension.load` 로 JIT 컴파일하고
    sm_86 gencode 가 하드코딩돼 있다. vLLM 빌드 시스템에 편입해야 한다.
 5. ~~V2 모델 러너 미지원~~ **해결됨.** 훅 6곳을 V2 에도 얹었다
@@ -94,22 +131,34 @@ DDTree (Diffusion Draft Tree, arXiv:2604.12989) 를 vLLM 에 구현한 것.
    V2 이므로 성능 비교는 반드시 V2 기준으로 해야 한다 (docs §28, §30~31).
    🔴 `enable_batch_sharded_sampling` 과는 같이 쓸 수 없다 — 훅 4 에 가드가 있다
    (docs §42-4). 기본값이 False 라 TP>1 만으로는 안 켜진다.
+   🔴 다만 V1 정본과 V2 실행본이 갈라져 있다 — 위 §구성 참조.
 6. **다중 요청에서 짧은 드래프트 미지원.** 확신 시 드래프트를 짧게 내는 경로는
    요청이 하나일 때만 켜진다. 한 스텝의 드래프트 폭을 텐서 하나로 공유하기 때문.
-7. **T>0 미지원.** 트리 거부 샘플링이 없다. 현재는 greedy 전용.
+7. ~~T>0 미지원~~ **해결됨** (§45). 그리고 **트리 기각 샘플링은 필요 없다** (§50-6):
+   그리디 드래프트 후보에서는 순차 기각 샘플링의 수용 확률이 `p₁ + p₂` 로
+   현행 '노드마다 뽑고 따라가기' 와 정확히 같다. §1 의 "T>0 트리 기각 샘플링이
+   필수" 는 철회됐다.
+8. **GDN 트리 커널의 T ≤ 8 상한.** T > 8 이면 융합 CUDA 커널을 못 쓰고 Triton
+   비융합 경로로 떨어져 스텝당 런치가 ~500개 늘어난다 — 8→9 토큰에서 단가가
+   +7 ms 계단으로 뛴다 (§50-5). 예산을 8 초과로 키우려면 이걸 먼저 넓혀야 한다.
 
 ## 알아둘 사실 (측정으로 확인)
 
   - 트리가 이기는 조건은 **드래프터가 불확실할 때**다. 확신하는 드래프터
     (DFlash2) 에서는 같은 예산의 사슬이 항상 낫다. 순수 어텐션+ngram 에서도
     반복 텍스트(확신)는 사슬이, 비반복 텍스트(불확실)는 트리가 이긴다.
-  - best-first 의 가중치는 위치별 확률의 **곱**이라 독립을 전제한다. 실측에서
-    DFlash2 는 자기 정확도를 과소평가하고 오차가 깊이에 따라 커져(깊이1 1.04배 →
-    깊이14 4.29배) 깊이 10 도달 확률을 108배 과소평가한다. 그래서 예산이 얕은
-    형제로 샌다. `depth_bonus`(가중치에 깊이당 상수를 **더한다**) 로 완화할 수
-    있다. 곱하면 단조 변환이라 무연산이다.
+  - **깊이는 드래프터 forward 를 하나씩 먹지만 폭은 안 먹는다.** 폭은 이미 가진
+    logits 에서 topk 를 하나 더 뽑을 뿐이다. 그래서 최적은 얕은 드래프터 + 넓은
+    트리인데, 그 폭의 값이 배치 1 에서만 크다 (위 이유 3).
+  - best-first 의 가중치는 위치별 확률의 **곱**이라 독립을 전제한다. 드래프터의
+    확률은 그 목적함수 기준으로 치우쳐 있고, `depth_bonus`(β, 깊이당 상수를
+    가중치에 **더한다**)와 `rank_bonus`(δ, 형제로 갈 때마다 더한다)로 보정한다.
+    곱하면 단조 변환이라 무연산이다.
+    🔴 **보정 상수의 부호는 체크포인트마다 다르다.** 4B DFlash 는 깊은 척추를
+    과소평가하는데 27B DFlash2 는 **과대**평가한다 (§16-3 대 §50-3). 새 드래프터에
+    붙일 때는 반드시 다시 재야 한다.
 
-자세한 실험 기록: 리포 루트의 `docs/DDTREE-SCOPING.md`. 위 문단은 §15~17 이고,
+자세한 실험 기록: 리포 루트의 `docs/DDTREE-SCOPING.md`.
 **결론과 철회 목록은 그 문서 맨 앞**에 있다.
 
 🔴 그 문서에는 철회된 결론이 많다. 이 README 에 한때 있던 "순수 어텐션 + ngram
