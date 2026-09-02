@@ -362,11 +362,140 @@ drafter's horizon is 8.
 
 ---
 
-## 11. Correctness findings
+## 11. Problems hit along the way, and what fixed them
 
-### 11.1 `num_computed_tokens_np` is an optimistic upper bound
+Everything below cost real time. Grouped by area; each item says what broke,
+why it was invisible until it wasn't, and the fix. Section numbers point into
+the Korean log.
 
-Depth-based RoPE needs each tree node's absolute position. We used
+### 11.1 Wiring tree masks into FlashInfer (§8)
+
+- **Don't pass `packed_custom_mask` yourself.** `plan()` skips
+  `segment_packbits` when given a packed mask, so the element-cumsum `indptr`
+  it computed (`[0, 441, 1081, 1137]`) reaches the kernel where byte offsets
+  (`[0, 56, 136, 143]`) are expected. Request 0 is correct by accident
+  (offset 0); everything after is garbage. Pass the bool `custom_mask` and let
+  FlashInfer pack it. An alignment hypothesis was tested and rejected first
+  (padding q·kv to multiples of 8 changed nothing).
+- **With a mask, `indptr` must be a CUDA tensor** (`segment_packbits` raises
+  otherwise). vLLM passes CPU `qo_indptr_prefill_cpu`; convert only when a mask
+  is present. `plan()` moves it back to CPU internally, so nothing else changes.
+- **Speculative verification tokens must take the prefill wrapper** — the decode
+  wrapper has no `custom_mask`. On sm_86 `supports_spec_as_decode` is False
+  (no trtllm-gen decode kernel, no dedicated XQA), so q_len>1 queries already go
+  to prefill. On hardware where that returns True this whole approach needs a
+  different entry point.
+- **Wiring proof** that caught nothing wrong later: inject a mask *equivalent*
+  to causal and require byte-identical output (proves indexing, per-request
+  offsets, page layout and GQA all at once), then mask the first key and
+  require the output to change.
+
+### 11.2 Mapping attention segments back to requests (§10, §12)
+
+- The first mapping assumed "decodes come first" in batch order. **With equal
+  tree sizes a wrong mapping is undetectable** — same budget, same q_len. Moved
+  to a `(q_len, kv_len)` signature; duplicate signatures fall back to causal.
+  This is still a heuristic (`ambiguous` reaches 30 at 4 requests with a tree
+  every step). The proper form for upstream is to carry tree info in
+  `CommonAttentionMetadata` so the mapping is vLLM's own.
+- **`kv_len` cannot be a key under async scheduling.** `num_computed_tokens_cpu`
+  is bumped by the scheduled amount first and rewound later (expected
+  `(17, 45)`, got `(17, 31)`). ngram uses sync scheduling, which hid it.
+- Two losslessness holes closed at the same time: a request whose tree was
+  *dropped* must not get chain acceptance (heap-ordered drafts are not a chain;
+  a sibling gets read as a successor) — emit the root token only; and only walk
+  trees that **actually received a mask** (`masked_trees`), because
+  causal-computed logits accept non-greedy tokens if you walk them as a tree.
+- **The draft return contract differs per path**: ngram returns
+  `list[list[int]]`, DFlash returns a GPU tensor `[batch, k]` (asserted in the
+  runner).
+
+### 11.3 Drafter coupling (§11, §21-7)
+
+- DFlash sets `block_size = 1 + num_speculative_tokens`, which **ties the tree
+  budget to the drafter horizon** (≤ 7 for a block-8 checkpoint). There is no
+  check for DFlash — the `block_size` check in `speculative.py` is DSpark-only —
+  so an oversized budget doesn't crash, it silently runs the conv at the wrong
+  width and degrades draft quality. Fix: `drafter_k = checkpoint block_size − 1`
+  (what the drafter emits), independent of `num_speculative_tokens` (what vLLM
+  schedules = the tree budget).
+- **At T=0 the drafter's per-position distributions are never materialised**
+  (`take_last_draft_probs` only under probabilistic drafting and non-greedy).
+  Intercept the logits in `_greedy_sample`. `draft_sample_method=probabilistic`
+  at T=0 is pure argmax (`gumbel_noised_argmax`), verified −0.09 ms and no
+  behavioural change.
+- DFlash (4B) and DFlash2 (27B) are **different architectures**: 6 layers/2560
+  full-attention vs 5 layers/5120 sliding-window-2048 with bidirectional
+  in-block attention. Our 4B drafter is a **SWA→full conversion** of the
+  original (V1 rejected mixed layer types), valid only for `seq_len ≤ 4096`.
+
+### 11.4 Recurrent (GDN) layers in hybrid targets (§12–§15)
+
+An attention mask cannot stop siblings in a recurrent layer — state advances in
+sequence order regardless. The tree needs the conv window gathered from
+*ancestor* columns, the SSM initial state loaded from the *parent* slot, and,
+after acceptance, the state re-laid out as a chain (`compact_gdn`) so vLLM's
+`num_accepted`-based rewind (`worker/mamba_utils.py`) keeps working.
+
+- **GDN uses a fused CUDA kernel by default** (`VLLM_GDN_DECODE_KERNEL=cuda`).
+  The Triton `_forward_core` path is dead code. Our first Python-level patches
+  never executed; **three rounds of fixes were made blind** before a counter on
+  the fallback path (`gdn_calls: 0`) showed it.
+- **Replacing the kernel with Python/Triton cannot reach bit-exactness.** A
+  0.22% relative error against `causal_conv1d_update` looked like bf16 noise
+  and is enough to flip an argmax across 48 layers. The fix was to *modify* the
+  original kernels to accept parent/ancestor indices, not replace them. That
+  required a vLLM rebuild.
+- Bugs that only appear with branching, all from "the accepted path is not a
+  prefix": SSM initial state loaded at `num_accepted − 1`; conv history zeroed
+  instead of rolled; the drafter grabbing the tree mask (same width, so
+  indistinguishable); Mamba precopy `src_off = num_accepted − 1`.
+- Five constraints found the hard way while modifying the conv update kernel:
+  (1) history must come from a **register snapshot** — STEP 2 can overwrite the
+  source block, so re-reading `conv_state` inside the loop returns shifted
+  values; (2) node values must come from the conv_state *target* block, because
+  `causal_conv1d_update` writes `out = x` **in place** and ancestors' `x` is
+  already overwritten; (3) never assign the loop-carried registers `col0..col2`
+  — it collides with the end-of-loop shift; (4) keep the multiply-accumulate
+  order identical or bits change; (5) compaction is **per KV-cache group** — on
+  27B `block_table[0]` is the *Mamba* group (block size 1024), and using it
+  alone filters out the attention cache entirely so compaction silently never
+  runs.
+- A patch was once applied to the **prefill** conv kernel instead of the update
+  kernel (`s.index()` took the first match). The update kernel stayed original,
+  so the chain test passed and hid it.
+- **The stock fused GDN kernel caps `state_indices` at `S ≤ 8`.** An
+  under-budget tree made `gdn_info()` return None, the layer fell back to the
+  stock kernel, and any budget > 8 crashed. Mixed batches also got
+  attention-as-tree / GDN-as-chain. Fix: `pad_tree_to_budget` fills the tree
+  with unused depth-0 candidates — lossless, since such a node is accepted only
+  if it *is* the greedy answer — and never inserts a duplicate token, because
+  `child_maps` is keyed by token. Later generalised: if any request lacks tree
+  info and width > 8, run our kernel with chain parents instead of crashing.
+- The claim "kernel verified up to T=33" was a **broken test**: it put the
+  initial state in slot 0 (which the kernel treats as null) and passed
+  `accepted=0`. With the correct convention it fails from T=16. Replaced by a
+  test with arbitrary non-monotonic slots, `accepted` 1–33, T=96, branch depth
+  11: error 0. The branch check needs no reference implementation — node *t*'s
+  output in a full tree run must equal the last output of running only its
+  ancestor path as a chain.
+- The "width-40 bug" (§18) turned out to be **no bug**: see 11.9.
+
+### 11.5 Positions and CUDA graphs (§26, §30, §32)
+
+- **Depth RoPE was silently ignored under CUDA graphs.** A captured piece reads
+  the buffer address it captured; replacing a local variable with a fresh
+  positions tensor does nothing, and the graph keeps using the sequential
+  `self.positions`. Eager passes arguments, so it worked there — which is why
+  this survived. Fix: write **in place** into the static positions buffer and
+  restore after the target forward (the drafter re-reads the buffer).
+  Byte-identical under eager, as intended.
+  This bug had manufactured an apparent win (§25): siblings all got sequential
+  positions and were "verified" as something that wasn't a tree, inflating
+  acceptance 4.43 → 2.84 per tree step once fixed.
+- V2's `FULL` cudagraph mode **does not pass inputs at all** — the in-place
+  requirement is mandatory there, not a nicety.
+- Depth-based RoPE needs each tree node's absolute position. We used
 `depth + num_computed[CPU mirror]`. In the V2 model runner that CPU mirror is an
 **optimistic upper bound** (`vllm/v1/worker/gpu/states.py:61` says so). V1
 rewinds the CPU value at the end of the step too, so the bug was invisible
@@ -378,9 +507,64 @@ GPU scalar so it costs no synchronization. Byte-identical no-op on V1.
 Anything that derives absolute positions from the CPU mirror mid-step has this
 bug.
 
-### 11.2 "Bit-identical to non-speculative greedy" is the wrong bar
+### 11.6 Model runner V1 vs V2 (§28, §30–§31, §42–§43)
 
-Tree verification diverged from greedy — but so does vLLM's *own* chain
+- Hooks were on the V1 runner only. **DFlash2 takes V2 by default**; only
+  ngram is V2-unsupported and falls back to V1. So the validation path was not
+  the real path, and every hybrid measurement before §28 ran on a runner
+  production doesn't use. The V2 chain baseline is 7% faster, which made the
+  gap 7 points worse.
+- The repo's `gpu/model_runner.py` cannot be dropped onto the container (63
+  lines of revision drift → `ImportError: DPSyncState`). Patch scripts apply to
+  the container-extracted original and **fail loudly on any missing anchor** —
+  a half-applied runner is the worst outcome.
+- The V2 sampler requires accounting (`num_sampled`, `num_rejected`) derived
+  from the emitted count; the V1 `SpecDecodeMetadata` adapter is built in numpy
+  because a tensor `.tolist()` would synchronise.
+- **`enable_batch_sharded_sampling` is incompatible**: at that point
+  `input_batch` holds only this rank's requests while DDTree state was filled
+  from the global batch — compaction touches other requests' slots, silently.
+  Explicit guard in hook 4. Plain TP=2 works: base itself matches TP=1 output
+  only 3/6 (reduction order), and DDTree matches at exactly the same 3/6, so
+  there is no TP-specific divergence.
+- Trace captured **warmup steps**: the harness warms up on 4 prompts first, and
+  every early trace was from that window. Clear the trace after warmup.
+
+### 11.7 Verification tooling that lied — five times (§18-6, §31)
+
+Each of these produced plausible numbers:
+
+| tool | fault |
+|---|---|
+| `t_tile.py` | initial state in slot 0 (= null to the kernel) |
+| `t20`/`t22` node-context check | prefix reconstructed from emitted counters — off by the optimistic bound |
+| logit-index reading | wrong index |
+| `t13` | parent array hardcoded to 8, so wide widths were never exercised |
+| `t24` | synthetic harness didn't reproduce production call arguments |
+
+What caught them every time was a control that **cannot be wrong**. Rules
+adopted: include a tree-free item (the root node) in every check — if that
+fails the harness is wrong; abort instead of printing when alignment is
+unverified; self-consistency (A vs A′) cannot catch a wrong convention, so keep
+an absolute reference (fp64 on *real dumped inputs*); judge divergence by logit
+gap before calling anything a bug, in either direction.
+
+Three "fixes" for the width-40 issue all failed and all were judged by
+*relative* comparison: fp32 `shared_out` (CUDA–Triton error 0.2% → 0.78%,
+worse), gate before normalisation (+358%; the grouped path normalises first and
+the original was right), conv compaction off-by-one (passed the unit test and
+the chain control, worse in the real run).
+
+Also: a failed run left a stale JSON that reported **+519%**; the harness now
+deletes the mode's output before running. One-step unit tests missed every
+state-carryover bug — equivalence tests must span multiple steps and be
+bit-exact. Swapping arms *inside* one process crashes (per-request node tables
+and `q_start` are not rewound) — A/B runs are container pairs with alternating
+order so thermal drift cancels.
+
+### 11.8 Batching, tolerance and the losslessness bar (§10-5, §29-3, §33)
+
+- Tree verification diverged from greedy — but so does vLLM's *own* chain
 speculative decoding, on **the same prompts at the same positions**. Once a
 draft is attached the query width is > 1 and the prefill kernel path is taken,
 which flips bf16 near-ties.
@@ -390,8 +574,18 @@ same conditions"**, and DDTree meets it. Judge divergences by the top-1/top-2
 logit gap, not by count: a gap in the bottom 5% of the distribution is a
 numerical tie, not a bug. We misjudged this in *both* directions before adopting
 the gap test.
+- Batch divergence: "bit-identical to non-spec greedy" also fails for vLLM's
+  own chain speculative decoding at batch 2 — matmul reduction shapes differ
+  (2 vs 18–34 queries/step), and bf16 near-ties flip. Three hypotheses (segment
+  mapping, RoPE/mask on different sets, cascade wrapper path) were all wrong;
+  the decisive experiment was that the breakage survives with the mask
+  disabled, i.e. with DDTree reduced to plain chain decoding.
+- Divergences that remained on 8B + EAGLE3 were **exact ties** (top-1/top-2
+  gap 0.0000, the narrowest position in the prompt) and top-2 swaps at gaps
+  ≤ 0.75 — the `custom_mask` prefill path has a different reduction order from
+  the plain decode kernel.
 
-### 11.3 GDN hybrids: the two kernels differ by exactly 1 bf16 ULP
+### 11.9 GDN hybrids: the two kernels differ by exactly 1 bf16 ULP (§18)
 
 Re-implementing the kernel maths in fp64 against real dumped inputs:
 
@@ -411,6 +605,22 @@ of steps and eventually flips a decision in deep trees. Not a logic error —
 amplification of arithmetic order.
 
 ---
+
+### 11.10 Smaller ones
+
+- The ngram test path looked at a single n; vLLM's proposer scans
+  `prompt_lookup_min..max`. Trees were being built on only 25% of steps
+  (32% after matching the scan). Coverage, not the tree, was the limiter on
+  8B + ngram.
+- GDN layers pulled `cu_seqlens` and `state_indices` to the host **twice per
+  layer** (48 D2H per step); the content is identical across layers. Cached per
+  step (`tolist_cached`, invalidated by `begin_step`). A companion claim that a
+  regression had shipped to non-DDTree users was **wrong** — the unguarded call
+  existed only in an uncommitted worktree.
+- `kv_compact` rebuilt the accepted-path index inside the per-group loop
+  (×3 on hybrids) and synchronised per group.
+- `docker run` killed by a tool timeout leaves an orphan container holding
+  ~1.9 GiB of GPU memory; the next run OOMs.
 
 ## 12. Side findings useful to vLLM independent of DDTree
 
