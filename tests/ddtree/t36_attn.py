@@ -182,7 +182,13 @@ if __name__ == "__main__":
     except Exception:
         _rm = "?"
 
-    sp = SamplingParams(temperature=0.0,
+    # 🔴 온도>0 검증은 시드를 고정해야 성립한다. vLLM 의 gumbel 은 (seed, 위치)로
+    #    노이즈를 인덱싱하므로, 같은 문맥·같은 위치면 같은 토큰이 나와야 한다.
+    #    그러면 T=0 무손실 검사를 그대로 T>0 으로 일반화할 수 있다.
+    _temp = float(os.environ.get("DDT_TEMP", "0"))
+    _seed = os.environ.get("DDT_SEED")
+    sp = SamplingParams(temperature=_temp,
+                        seed=(int(_seed) if _seed else None),
                         max_tokens=int(os.environ.get("DDT_MAXTOK", "96")))
     for p in PROMPTS:   # 워밍업 — 컴파일/캡처/오토튠이 첫 프롬프트에 섞이지 않게
         llm.generate([p], SamplingParams(temperature=0.0, max_tokens=8),

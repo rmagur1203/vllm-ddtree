@@ -57,6 +57,7 @@ class _DDTSpecMD:
         if nd is None:
             nd = _np.zeros(input_batch.num_reqs, dtype=_np.int32)
         self.num_draft_tokens = [int(x) for x in nd]
+        self.num_draft_tokens_np = _np.asarray(nd, dtype=_np.int64)
         self.cu_num_draft_tokens = _np.cumsum(nd, dtype=_np.int64)
         # V1 은 선행 0 을 뺀 누적을 쓴다 (starts = [0] + cu[:-1])
         self.cu_num_sampled_tokens = _np.asarray(
@@ -241,7 +242,26 @@ sub("""        else:
                     "DDTree 는 enable_batch_sharded_sampling 과 같이 쓸 수 없다 "
                     "(훅 2 의 전역 배치 인덱스와 어긋난다)."
                 )
-            _tok, _paths = self.ddtree.accept(logits, _DDTSpecMD(input_batch))
+            # 온도>0 이면 타깃 분포에서 뽑는다. vLLM 자신의 gumbel 경로를 그대로
+            # 쓰되 노이즈 위치를 **노드의 깊이 위치**로 준다 (그 노드가 차지할
+            # 출력 위치). 온도 0 이면 순수 argmax 라 기존과 동일하다.
+            _samp = None
+            if self.sampler is not None:
+                from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample as _gs
+                _p = self.ddtree.sample_positions(input_batch.positions)
+                _p = _p[input_batch.logits_indices]
+                _eim = input_batch.expanded_idx_mapping
+                if _eim.shape[0] != logits.shape[0]:
+                    _eim = input_batch.idx_mapping.repeat_interleave(
+                        torch.from_numpy(
+                            _DDTSpecMD(input_batch).num_draft_tokens_np + 1
+                        ).to(input_batch.idx_mapping.device))
+                _samp = _gs(logits, _eim,
+                            self.sampler.sampling_states.temperature.gpu,
+                            self.sampler.sampling_states.seeds.gpu,
+                            _p, apply_temperature=True)
+            _tok, _paths = self.ddtree.accept(
+                logits, _DDTSpecMD(input_batch), _samp)
             self.ddtree.compact(self.kv_caches, _paths)
             # 🔴 V2 의 SamplerOutput 은 num_sampled/num_rejected 를 요구한다
             #    (V1 은 안 그랬다). 방출 토큰 수에서 역산한다.

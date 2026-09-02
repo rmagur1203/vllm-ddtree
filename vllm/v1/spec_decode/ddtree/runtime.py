@@ -608,7 +608,18 @@ class DDTreeRuntime:
         return torch.tensor(rows, dtype=torch.int32, device=self.device)
 
     # ------------------------------------------------------------------ 5
-    def accept(self, logits: torch.Tensor, spec_md):
+    def sample_positions(self, positions: torch.Tensor):
+        """노드마다 '그 노드가 차지할 출력 위치'. 온도>0 샘플링의 노이즈 색인용.
+
+        vLLM 의 gumbel 경로는 (seed, 위치)로 노이즈를 인덱싱한다. 트리에서 깊이 d
+        노드의 출력 위치는 num_computed + d 이고, 그건 깊이 RoPE 가 이미 계산해
+        둔 값이다. 같은 깊이의 형제들은 같은 노이즈를 쓰지만 **수용 경로에는
+        깊이마다 노드가 하나뿐**이라, 방출된 토큰은 그 위치의 노이즈로 뽑힌
+        p 의 정당한 draw 다.
+        """
+        return self._rope if self._rope is not None else positions
+
+    def accept(self, logits: torch.Tensor, spec_md, sampled_ids=None):
         _t0 = time.perf_counter()
         """T=0 검증. 반환: ([num_reqs, width] (-1 패딩), {배치인덱스: 수용경로})."""
         if self.time_split:
@@ -620,7 +631,13 @@ class DDTreeRuntime:
         starts = [0] + cu[:-1]
         self.t["a_meta"] += time.perf_counter() - _ta
         _ta = time.perf_counter()
-        argmax = logits.argmax(dim=-1).tolist()
+        # 🔴 온도>0 이면 argmax 가 아니라 타깃 분포에서 뽑아야 한다. 노드 i 의
+        #    logits 는 조상 문맥으로 계산되므로(트리 마스크의 정의), 노드마다
+        #    뽑고 그 토큰으로 트리를 내려가면 **방출 열은 타깃 분포의 정당한
+        #    표본**이다 — 매 위치에서 p 로부터 뽑은 것이기 때문이다.
+        #    온도 0 이면 gumbel 경로가 순수 argmax 라 기존과 동일하다.
+        argmax = (logits.argmax(dim=-1) if sampled_ids is None
+                  else sampled_ids).tolist()
         self.t["a_argmax"] += time.perf_counter() - _ta
         by_index = dict(self.step)
 
