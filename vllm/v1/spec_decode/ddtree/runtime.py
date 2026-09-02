@@ -101,6 +101,8 @@ class DDTreeRuntime:
         self._attn_cache_memo: dict = {}
         self.masked_trees: set[int] = set()
         self._gdn_memo = None
+        # (all_token_ids, num_computed_tokens, idx_mapping) — trace 전용 접두사 프로브
+        self._probe = None
         self.step_req_ids: list = []
         # 요청별 드래프트 길이. 텐서는 최대 폭으로 패딩되므로, 스케줄러에
         # 넘길 때 각 행을 이 길이로 잘라야 요청마다 다른 길이가 성립한다.
@@ -369,6 +371,33 @@ class DDTreeRuntime:
                   f"q={[int(self.q_start[i+1]-self.q_start[i]) for i in range(num_reqs)]} "
                   f"trees={[i for i, _ in self.step]}", file=self._dbg)
         return bool(self.step)
+
+    def set_prefix_probe(self, all_token_ids, num_computed_gpu, idx_mapping_np):
+        """접두사 토큰 ID 를 '권위 있는' 출처에서 그대로 읽기 위한 통로 (trace 전용).
+
+        🔴 사후 검증에서 접두사를 추정하면 안 된다. 방출 카운터(emitted_before)는
+           스펙이 안 붙은 스텝을 놓치고, num_computed_tokens_np 는 낙관적 상한이라
+           (gpu/states.py:61) 둘 다 스텝마다 어긋난다. 토큰이 몇 종류 없는 프롬프트
+           (예: "소수" -> ' ', '3', ',')에서는 틀린 정렬도 우연히 통과해서
+           '루트 문맥 오염' 같은 가짜 결론이 나온다 (2026-08-31 실측, §31-15 철회).
+           all_token_ids/num_computed_tokens 는 vLLM 자신이 어텐션에 쓰는 값이다.
+
+        🔴 V2 러너 패치(tools/ddtree_patch_v2_runner.py)가 trace 를 켰을 때 이걸
+           부른다. 없으면 AttributeError 다.
+        """
+        self._probe = (all_token_ids, num_computed_gpu, idx_mapping_np)
+
+    def _read_prefix(self, i: int) -> list[int]:
+        """배치 인덱스 i 요청의 KV 에 실제로 들어있는 접두사 토큰 ID."""
+        if self._probe is None:
+            return []
+        tok, nc_gpu, idx_map = self._probe
+        g = int(idx_map[i])
+        n = int(nc_gpu[g].item())        # 권위값 — trace 전용이라 동기화 비용 무관
+        # 🔴 n+1 까지 읽는다. tree.token_ids 에는 루트가 빠져 있다 — 루트는 직전
+        #    스텝이 낸 토큰이고 KV 가 아직 없어서 쿼리 맨 앞에 실린다. 즉
+        #    노드 문맥 = prefix_ids + [root] + 조상 경로 다.
+        return [int(x) for x in tok[g, : n + 1].tolist()]
 
     @property
     def active(self) -> bool:
@@ -726,6 +755,9 @@ class DDTreeRuntime:
                         #    놓쳐 오프셋이 스텝마다 달라진다. 실제 접두사 길이를 직접
                         #    기록해야 사후 검증에서 정렬을 추정하지 않아도 된다.
                         "prefix_len": int(self.num_computed[i]) if self.num_computed is not None else -1,
+                        # 🔴 유일하게 믿을 수 있는 접두사 — 추정이 아니라 실측이다.
+                        #    prefix_ids[:-1] 이 KV 접두사, [-1] 이 루트 토큰이다.
+                        "prefix_ids": self._read_prefix(i),
                         "tokens": [int(x) for x in tree.token_ids],
                         "parents": [int(x) for x in tree.parents],
                         "depths": [int(x) for x in tree.depths],
