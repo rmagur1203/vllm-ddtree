@@ -21,20 +21,43 @@ and no profiling hooks unless stated.
 ## 1. Verdict
 
 DDTree vs. **the same drafter running a flat chain at the same budget** — not
-vs. no speculation.
+vs. no speculation. Every drafter type available to us was tried: none
+(baseline), n-gram prompt lookup, block-diffusion (DFlash, DFlash2) and an
+autoregressive draft head (EAGLE3), on targets from 0.6B to 27B, pure-attention
+and GDN-hybrid, batch 1 to 16, greedy and sampled.
 
-| Configuration | batch | DDTree vs chain |
-|---|---|---|
-| Qwen3.8-27B-AWQ (GDN hybrid) + DFlash2, T=0 | 1 | **0.78x** |
-| Qwen3.8-27B-AWQ + DFlash2, production sampling¹ | 1 | **0.69x** |
-| Qwen3-8B (pure attention) + EAGLE3, T=0 | 1 | **1.00x** (tie) |
-| Qwen3-8B + EAGLE3 | 2 / 4 / 16 | 0.98x / 0.97x / 0.96x |
-| Qwen3.5-4B (GDN hybrid) + DFlash | 1 | 0.68x² |
+| Target | Drafter | batch | DDTree vs chain | What decided it | § |
+|---|---|---|---|---|---|
+| Qwen3-0.6B (pure attn) | n-gram | 1 | 0.95x | fewer steps (184 vs 193) but the per-step cost isn't covered; on a 2.7 ms/step model even the chain loses to no-spec (1.217s vs 1.045s) | §24, §26 |
+| Qwen3.5-4B (GDN hybrid) | DFlash | 1 | **0.68x** | same 34 steps in both arms — zero acceptance gain; eager hid the cost entirely (§2) | §23 |
+| Qwen3-8B (pure attn) | n-gram | 1 | ~1.01x (tie) | branching helps (+5.8%) but the drafter fires on only **28% of steps** — no draft, no tree | §27-1 |
+| Qwen3-8B (pure attn) | EAGLE3 | 1 | **1.00x** (tie) | +17.6% acceptance on hard prompts exactly cancelled by tree machinery | §35–§44 |
+| Qwen3-8B (pure attn) | EAGLE3 | 2 / 4 / 16 | 0.98x / 0.97x / 0.96x | verification width stops being free; optimal budget shrinks 16 → 8 → 4 | §41 |
+| Qwen3.8-27B-AWQ (GDN hybrid) | DFlash2, T=0 | 1 | **0.78x** | 0.66x before removing our own overhead (§5); the rest is a structural GPU-idle bubble (§4) | §42, §48 |
+| Qwen3.8-27B-AWQ | DFlash2, production sampling¹ | 1 | **0.69x** | siblings steal spine slots and the spine is weaker at T=1 | §50 |
+| Qwen3.8-27B-AWQ | DFlash2, superset trees (budget 8–32) | 1 | 0.61–0.73x | acceptance saturates at two siblings (§8) | §50 |
 
 ¹ `temperature=1.0, top_k=20, top_p=0.95` — vLLM's default when
 `--generation-config` is unset, taken from the model's `generation_config.json`.
 Any client that doesn't send a temperature gets this.
-² Measured before the fixes in §5; not re-measured.
+
+Not in the table: the **MTP head** (`qwen3_5_mtp`, k=3) was the production
+baseline before this work and was evaluated only as a *chain* against DFlash2
+when choosing the production drafter — DFlash2 with dynamic k won by +39.9% at
+concurrency 1 and +12.4% at 4, and tied from 8 upward
+(`TROUBLESHOOTING.md` §32). We never ran DDTree on the MTP head.
+
+Two things the matrix says on its own:
+
+- **Speculation itself only pays on a large enough target.** On 0.6B no
+  speculative method beats plain decoding; on 8B the chain is 1.5–1.6× base;
+  on 27B it is 2.07× (32.36s → 15.60s). The chain baseline DDTree has to beat
+  is therefore strongest exactly where production runs.
+- **Both kinds of "bad" drafter fail for opposite reasons.** n-gram is
+  *absent* (72% of steps have no draft to branch), DFlash2 is *too right*
+  (rank-0 already correct, siblings idle). The tree needs a drafter that is
+  present, frequently wrong at rank 0, and right at rank 1–2 — EAGLE3 on
+  open-ended prompts comes closest, and that case is a tie.
 
 The best case we found — pure attention, a drafter that is frequently wrong,
 batch 1 — is a **tie**. Production is the opposite of all three.
