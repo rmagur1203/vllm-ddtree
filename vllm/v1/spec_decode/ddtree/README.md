@@ -19,6 +19,7 @@ DDTree (Diffusion Draft Tree, arXiv:2604.12989) 를 vLLM 에 구현한 것.
     tools/ddtree_patch_v2_*.py    V2 러너·speculator 에 훅을 얹는 패치 스크립트
     tests/ddtree/                 검증 스크립트
     docs/DDTREE-SCOPING.md        실험 기록 전체 (결론과 철회 목록은 맨 앞)
+    docs/DDTREE-FINDINGS-EN.md    위 문서의 영어 요약 (외부 공유용)
 
 기존 vLLM 파일 중 고친 것:
 

@@ -1,5 +1,8 @@
 # DDTree on vLLM — 구현 스코핑 (2026-08-27)
 
+> **English summary: [DDTREE-FINDINGS-EN.md](DDTREE-FINDINGS-EN.md)** — 결론·측정
+> 규칙·실패한 최적화·철회 목록을 영어로 정리한 것. 외부에 공유할 때 이쪽을 건다.
+
 ---
 
 # 결론 (2026-09-01, §29~43 요약)
