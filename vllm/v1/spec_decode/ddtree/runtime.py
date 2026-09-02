@@ -93,6 +93,7 @@ class DDTreeRuntime:
         self.groups = []   # [(slot_mapping, block_size)] — KV 캐시 그룹별
         self._attn_cache_memo: dict = {}
         self.masked_trees: set[int] = set()
+        self._gdn_memo = None
         self.step_req_ids: list = []
         # 요청별 드래프트 길이. 텐서는 최대 폭으로 패딩되므로, 스케줄러에
         # 넘길 때 각 행을 이 길이로 잘라야 요청마다 다른 길이가 성립한다.
@@ -323,6 +324,7 @@ class DDTreeRuntime:
         self.q_start = np.asarray(query_start_loc_np[: num_reqs + 1])
         self._rope = None
         self.masked_trees = set()   # 이번 스텝에 실제로 트리 마스크를 받은 트리들
+        self._gdn_memo = None       # GDN 계층들이 스텝 안에서 공유하는 트리 텐서
         self.causal_ok = set()      # 사슬이라 마스크 없이도 옳은 트리들
         self.stats["steps"] += 1
         # 🔴 self.step 은 배치 인덱스로 트리를 들고 있는데, GDN·마스크 계층은
@@ -542,6 +544,17 @@ class DDTreeRuntime:
         if not self.step:
             self.stats["gdn_no_step"] += 1
             return None
+        # 🔴 이 함수는 **GDN 계층마다** 불린다 (27B 는 48회/스텝). 그런데 결과는
+        #    계층 간 완전히 동일하다 — 같은 스텝의 같은 트리다. 그런데도 계층마다
+        #    parents 텐서와 tree_cols 를 처음부터 다시 만들고 있었다: 파이썬 루프로
+        #    numpy 를 짓고 H2D 를 두 번 하는 것을 48번. 스텝당 한 번만 만든다.
+        #    (같은 파일의 tolist_cached 가 state_indices 에 대해 하는 것과 같은 이유.)
+        #    실측(27B, 예산7): -9.77 ms/스텝. 사슬 대비 0.660x -> 0.780x.
+        _k = (n_spec_reqs, tuple(T) if not isinstance(T, int) else T, width)
+        _m = self._gdn_memo
+        if _m is not None and _m[0] == _k:
+            self.stats["gdn_tree"] += 1
+            return _m[1]
         # 🔴 배치에 트리 있는 요청과 없는 요청이 섞일 수 있다. 예전에는 전부
         #    맞아야만 트리 정보를 주고 아니면 None 을 돌렸는데, 물러선 자리가
         #    8토큰 상한이 있는 원본 커널이라 예산>8 이면 죽는다.
@@ -571,12 +584,14 @@ class DDTreeRuntime:
         self.stats["gdn_tree"] += 1
         from vllm.v1.spec_decode.ddtree.gdn import cols_from_parents
         # parents 에서 바로 만든다 — 트리 없는 요청의 사슬 부모도 그대로 반영된다.
-        return {
+        _info = {
             "tree_cols": cols_from_parents(par, lens, width, self.device),
             "parents": par,
             # 압축은 트리를 실제로 받은 요청에만 적용한다 (없으면 None → 건너뜀).
             "keys": [key_by_rank.get(r) for r in range(n_spec_reqs)],
         }
+        self._gdn_memo = (_k, _info)
+        return _info
 
     def tree_parents_tensor(self, n_spec_reqs: int, T: int,
                             lens=None, by_idx=None):
