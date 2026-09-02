@@ -254,3 +254,7 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# DDTree 검증 스크립트의 실행 산출물 (tests/ddtree/t*.py 가 컨테이너 /work 에 쓴다)
+tests/ddtree/out_*.json
+tests/ddtree/t36_*.json
