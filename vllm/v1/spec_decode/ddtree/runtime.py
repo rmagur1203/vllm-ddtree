@@ -70,6 +70,11 @@ class DDTreeRuntime:
         self.depth_cap = 1 << 30   # 드래프터 깊이를 잘라 얕은 트리만 만든다 — 디버깅용
         self.no_accept = False     # True 면 절대 수용 안 함 — 배선 격리용
         self.no_mask = False       # True 면 마스크 자체를 안 준다 — 이분법용
+        # 🔴 아래 둘은 **측정 전용 격리 손잡이**다. 사슬 모양 트리에서는 둘 다
+        #    무손실을 안 깨므로(스톡 GDN 경로가 옳고, 깊이 위치 == 순차 위치)
+        #    '그 구간의 값' 만 떼어낼 수 있다. 분기 트리에서는 출력이 깨진다.
+        self._no_gdn = _os.environ.get("VLLM_DDTREE_NOGDN") == "1"
+        self._no_rope = _os.environ.get("VLLM_DDTREE_NOROPE") == "1"
         # 사슬 트리에는 custom_mask 를 안 준다 (causal 과 동치라 옳다).
         # custom_mask 커널의 값을 파이프라인을 켠 채로 재는 유일한 방법이기도 하다.
         self.skip_chain_mask = _os.environ.get("VLLM_DDTREE_CHAINMASK", "1") != "0"
@@ -375,7 +380,7 @@ class DDTreeRuntime:
 
         호출 순서상 안전하다: begin_step → attn 메타데이터 빌드(마스크) → forward(여기).
         """
-        if not self.step:
+        if not self.step or self._no_rope:
             return None
         if self._rope is None:
             if self.time_split:
@@ -454,6 +459,17 @@ class DDTreeRuntime:
                   f"trees={[(i, t.num_nodes) for i, t in self.step]} "
                   f"paired={len(pairing)}", file=self._dbg)
 
+        # 🔴 진짜 트리 마스크가 하나도 필요 없으면 **만들기 전에** 빠진다.
+        #    예전에는 세그먼트마다 q x k causal 배열을 다 지어놓고 마지막에
+        #    None 을 돌려 통째로 버렸다.
+        if self.skip_chain_mask and all(
+                (t is None) or t.is_chain
+                for t in (pairing.get(j) for j in range(len(kvs)))):
+            for t in pairing.values():
+                self.causal_ok.add(id(t))
+                self.stats["chain_mask_skip"] += 1
+            self.t["mask"] += time.perf_counter() - _t0
+            return None
         parts = []
         for j in range(len(kvs)):
             q = qs[j + 1] - qs[j]
@@ -538,7 +554,7 @@ class DDTreeRuntime:
         요청 순서대로의 시퀀스를 받는다. 커널은 cu_seqlens 로 요청별 길이를
         이미 다루므로 균일할 필요가 없다 — 이 검사만 맞으면 된다.
         """
-        if self.in_drafter:
+        if self.in_drafter or self._no_gdn:
             return None
         self.stats["gdn_calls"] += 1
         if not self.step:
