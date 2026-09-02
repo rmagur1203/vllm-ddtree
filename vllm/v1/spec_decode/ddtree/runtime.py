@@ -240,6 +240,11 @@ class DDTreeRuntime:
                 pad_to_budget=True,
             )
             trees[i] = tree
+            if self.trace_n and len(self.trace) < self.trace_n:
+                # 분석 전용 (trace 켠 경우만). 형제 적중률을 **편향 없이** 재려면
+                # 트리에 안 들어간 후보까지 알아야 한다 — 깊이별 상위 16개.
+                tree.ids_top = ids_all[i][:, :16].tolist()
+                tree.lp_top16 = lp_all[i][:, :16].tolist()
         self.t["p_build"] += time.perf_counter() - _t2
         width = max((t.num_nodes - 1 for t in trees.values()), default=self.budget)
         width = max(1, min(width, self.budget))
@@ -727,6 +732,8 @@ class DDTreeRuntime:
                         "sampled": [int(x) for x in sampled],
                         "accepted": [int(x) for x in acc],
                         "lp_top": tree.lp_top,
+                        "ids_top": getattr(tree, "ids_top", None),
+                        "lp_top16": getattr(tree, "lp_top16", None),
                         # 보정 측정용: 노드별 부모 조건부 log-prob 과 그 깊이의 rank
                         "node_lp": (None if tree.node_lp is None
                                     else [None if v != v else float(v)
