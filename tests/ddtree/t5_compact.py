@@ -109,7 +109,18 @@ def main():
         print(f"  {'🟢' if ok else '🔴'} {name:<22} 레이어={nl:<3} 행={src.numel():<3} "
               f"triton오차={e_tri}  torch오차={e_ref}")
 
-    print(f"\n{len(CASES)}건 중 실패 {bad}건 —",
+    # 🔴 포인터 메모가 실제로 맞는지. 안 맞으면 변경이 조용히 무효가 된다
+    #    (결과는 그대로 맞아서 위 9건으로는 절대 안 잡힌다).
+    from vllm.v1.spec_decode.ddtree.compact import _cache_ptrs
+    cs = [torch.zeros(4, 16, 2, 16, dtype=torch.bfloat16, device=DEV)
+          for _ in range(3)]
+    p1, p2 = _cache_ptrs(cs), _cache_ptrs(cs)
+    hit = p1 is p2
+    val = p1.tolist() == [c.data_ptr() for c in cs]
+    print(f"  {'🟢' if hit and val else '🔴'} 포인터 메모: 재사용={hit} 값일치={val}")
+    bad += not (hit and val)
+
+    print(f"\n{len(CASES)}건 + 메모 1건 중 실패 {bad}건 —",
           "🟢 컴팩션 정확" if bad == 0 else "🔴 불일치")
     return 1 if bad else 0
 

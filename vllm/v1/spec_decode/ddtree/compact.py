@@ -107,6 +107,29 @@ def attention_caches(caches, block_size: int):
 # 맞도록 BLOCK 을 줄이고, 모자란 만큼은 fblk 축 병렬로 돌린다.
 _TILE_BYTES = int(os.environ.get("VLLM_DDTREE_COMPACT_TILE", "4096"))
 
+# 🔴 캐시 포인터는 KV 캐시를 할당한 뒤로 안 바뀌는데, 호출마다 파이썬 리스트를
+#    만들어 H2D 로 올리고 있었다. 실측 (27B, 어텐션 16계층): 커널 호출 59.4us 중
+#    31.7us — 절반이 넘는다. 스텝마다 캐시 그룹 수만큼 반복되므로 그대로 쌓인다.
+#    키에 device 를 넣는 이유: 포인터 값은 디바이스마다 독립이라 겹칠 수 있다.
+_PTR_CACHE: dict[tuple, torch.Tensor] = {}
+_PTR_CACHE_MAX = 8      # 운영에서는 키가 (그룹당) 하나뿐이다 — 테스트용 상한
+_NO_PTR_MEMO = os.environ.get("VLLM_DDTREE_NOPTRMEMO") == "1"
+
+
+def _cache_ptrs(caches) -> torch.Tensor:
+    """캐시 data_ptr 들을 담은 int64 텐서. 같은 캐시면 같은 텐서를 돌려준다."""
+    dev = caches[0].device
+    key = (dev.type, dev.index) + tuple(c.data_ptr() for c in caches)
+    t = None if _NO_PTR_MEMO else _PTR_CACHE.get(key)
+    if t is None:
+        t = torch.tensor([c.data_ptr() for c in caches],
+                         dtype=torch.int64, device=dev)
+        if not _NO_PTR_MEMO:
+            if len(_PTR_CACHE) >= _PTR_CACHE_MAX:
+                _PTR_CACHE.clear()
+            _PTR_CACHE[key] = t
+    return t
+
 
 def compact_kv_triton(caches, src_slots, dst_slots, seg_start, block_size: int,
                       max_seg_rows: int) -> None:
@@ -118,11 +141,9 @@ def compact_kv_triton(caches, src_slots, dst_slots, seg_start, block_size: int,
     rowb = row_bytes(caches[0], block_size)
     maxrows = triton.next_power_of_2(max(1, int(max_seg_rows)))
     block = triton.next_power_of_2(min(rowb, max(64, _TILE_BYTES // maxrows)))
-    ptrs = torch.tensor([c.data_ptr() for c in caches],
-                        dtype=torch.int64, device=caches[0].device)
     grid = (len(caches), seg_start.numel() - 1, triton.cdiv(rowb, block))
     _compact_kernel[grid](
-        ptrs, src_slots.to(torch.int32), dst_slots.to(torch.int32),
+        _cache_ptrs(caches), src_slots.to(torch.int32), dst_slots.to(torch.int32),
         seg_start.to(torch.int32), ROWB=rowb, BLOCK=block, MAXROWS=maxrows,
     )
 
