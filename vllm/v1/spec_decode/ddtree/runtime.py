@@ -80,6 +80,8 @@ class DDTreeRuntime:
         self.skip_chain_mask = _os.environ.get("VLLM_DDTREE_CHAINMASK", "1") != "0"
         # 퇴화 빠른 경로를 끄는 스위치 — A/B 로 출력 동일성을 확인할 때 쓴다
         self._nofast = _os.environ.get("VLLM_DDTREE_NOFAST") == "1"
+        # 🔴 측정 전용 — 제거한 압축 안전성 검사(D2H 동기화)를 되살린다.
+        self._compact_check = _os.environ.get("VLLM_DDTREE_CCHECK") == "1"
         self.in_drafter = False    # 드래프터 forward 중에는 트리 마스크를 주면 안 된다
         self.use_ngram_drafter = True   # dflash 드래프터가 없을 때의 테스트 경로
         # 🔴 ngram 경로는 n 을 하나만 봤다. 순정 vLLM 제안기는
@@ -863,38 +865,36 @@ class DDTreeRuntime:
         if not plans:
             return
 
-        _tv = time.perf_counter()
-        # 🔴 예전에는 그룹마다 .item() 을 불러 스텝당 그룹 수만큼 파이프라인이 섰다.
-        #    전부 쌓아 한 번만 내린다.
-        # 🔴 이 검사 자체가 D2H 동기화다. triton 커널이 dst<=src 순서를 전제하기
-        #    때문에 필요한데, torch 구현(gather 후 scatter)은 전제가 없으니 검사할
-        #    이유도 없다. (실측: torch 로 바꿔 동기화를 빼도 커널이 더 느려
-        #    순손해였다 — triton + 검사가 여전히 낫다. 손잡이만 정확히 둔다.)
-        if self.compact_impl == "torch":
-            _viols = [0] * len(plans)
-        else:
-            _viols = torch.stack([(d > s_).sum() for _, _, s_, d in plans]).tolist()
-        self.t["c_viol"] += time.perf_counter() - _tv
+        # 🔴 여기에 `(dst > src).sum()` 안전성 검사가 있었다. triton 커널이 행을
+        #    증가 순서로 순차 처리하면서 dst<=src 를 **슬롯 공간에서** 전제했기
+        #    때문인데, 그 검사가 D2H 동기화라 압축이 도는 스텝마다 파이프라인을
+        #    세웠다. 커널이 '전부 읽고 나서 전부 쓰기' 로 바뀌어 전제가 사라졌으니
+        #    검사할 것이 없다 (compact.py 의 경쟁 조건 주석 참고).
+        #    ('torch 구현으로 바꿔 동기화를 뺀다' 는 이미 시도했고 커널이 더 느려
+        #     순손해였다 — 그래서 전제를 없애는 쪽으로 갔다.)
+        # 🔴 MAXROWS 는 커널이 constexpr 로 받아야 하는데 seg 가 이미 CPU 에 있어
+        #    공짜다. 이걸 GPU 에 물어보면 뺀 동기화가 도로 살아난다.
+        # 🔴 측정 전용. 뺀 D2H 를 도로 넣어 **그 동기화 하나의 값**만 잰다.
+        #    커널은 이미 안전하므로 결과는 어느 쪽이든 같다 (출력 바이트 동일이
+        #    이 손잡이의 합격 조건이다).
+        if self._compact_check:
+            _tv = time.perf_counter()
+            self.stats["compact_unsafe"] += sum(
+                torch.stack([(d > s_).sum() for _, _, s_, d in plans]).tolist())
+            self.t["c_viol"] += time.perf_counter() - _tv
 
-        for (caches, block_size, _src, _dst), _viol in zip(plans, _viols):
-            _viol = int(_viol)
-            # 🔴 compact_kv_triton 은 세그먼트 안에서 순차로 돌면서 dst[i] <= src[i]
-            #    (둘 다 증가) 를 전제로 한다. a[i] >= i 는 항상 참이지만, 그게 슬롯으로
-            #    옮겨가려면 slot_mapping 이 이 구간에서 단조 증가여야 한다. 토큰이 KV 블록
-            #    경계를 넘으면 다음 블록 id 가 더 작을 수 있어(블록은 free pool 에서 나온다)
-            #    전제가 깨지고, 나중 쓰기가 앞선 읽기의 원본을 덮는다.
+        _maxrow = max(seg[i + 1] - seg[i] for i in range(len(seg) - 1))
+        for caches, block_size, _src, _dst in plans:
             self.stats["kv_groups"] += 1
             self.stats["kv_rows"] += n
-            if _viol:
-                self.stats["compact_unsafe"] += _viol
             _tk = time.perf_counter()
-            if _viol or self.compact_impl == "torch":
-                # gather 후 scatter — 순서 전제가 없다
+            if self.compact_impl == "torch":
+                # gather 후 scatter — 레퍼런스 구현
                 compact_mod.compact_kv_torch(caches, _src, _dst, seg_t,
                                              block_size)
             else:
                 compact_mod.compact_kv_triton(
-                    caches, _src, _dst, seg_t, block_size,   # 이미 int32 다
+                    caches, _src, _dst, seg_t, block_size, _maxrow,  # 이미 int32 다
                 )
             self.t["c_kernel"] += time.perf_counter() - _tk
         self.t["kv_compact"] += time.perf_counter() - _t0

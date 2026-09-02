@@ -4,11 +4,18 @@ DDTree KV 컴팩션 — 수용된 트리 노드의 K/V 만 앞으로 당긴다.
 체인 스펙 디코딩은 수용 토큰이 접두사라 num_computed_tokens 되감기로 끝나지만,
 트리는 수용 경로가 트리 슬롯 범위에 흩어져 있어 gather 가 필요하다.
 
-🔴 경쟁 조건
-   dst[i] = base+i, src[i] = base+a[i] (a 증가, a[i] >= i) 이므로 dst[i] <= src[i].
-   그리고 i' > i 이면 src[i'] > dst[i] 다. 따라서 **행을 증가 순서로 순차 처리**하면
-   아직 안 읽은 소스를 덮어쓸 일이 없다. 병렬은 (레이어, 요청, 바이트블록) 축으로만 낸다.
-   임시 버퍼가 필요 없다.
+🔴 경쟁 조건 — 없다 (2026-09-02)
+   예전에는 **행을 증가 순서로 순차 처리**해서 아직 안 읽은 소스를 안 덮게 했다.
+   그 전제는 dst[i] <= src[i] 가 **슬롯 공간에서도** 성립해야 참인데, 트리가 KV
+   블록 경계를 넘으면 다음 블록 id 가 더 작을 수 있어(블록은 free pool 에서 나온다)
+   깨진다. 그래서 호출부가 매 스텝 `(dst > src).sum()` 을 **D2H 로 읽어** 안전한지
+   확인했고, 그 읽기 하나가 파이프라인을 세웠다 (~0.95 ms).
+
+   지금은 커널이 세그먼트의 행을 **전부 읽은 뒤에 전부 쓴다**. gather 의미가
+   그대로라 순서에 아무 전제가 없고, 따라서 검사도 D2H 도 필요 없다.
+   프로그램끼리는 원래 안 겹친다 — 세그먼트(요청)는 슬롯이 서로 다르고,
+   fblk 는 행 안의 바이트 구간이 서로 다르고, layer 는 캐시가 다르다.
+   대신 타일이 [MAXROWS, BLOCK] 이라 레지스터 압력이 곱으로 는다 (아래 BLOCK 조정).
 
 레이아웃
    vLLM/FlashInfer 가 실제로 쓰는 배치에서 슬롯 하나의 K·V 는 메모리상 연속이다.
@@ -18,6 +25,8 @@ DDTree KV 컴팩션 — 수용된 트리 노드의 K/V 만 앞으로 당긴다.
    이 성질을 strides 로 검사한다 (row_bytes 참고). 성립 안 하면 명시적으로 실패한다.
 """
 from __future__ import annotations
+
+import os
 
 import torch
 import triton
@@ -48,8 +57,9 @@ def _compact_kernel(
     cache_ptrs,          # int64[num_layers]
     src_ptr, dst_ptr,    # int32[total_rows] — 슬롯 id
     seg_start_ptr,       # int32[num_segments + 1]
-    ROWB: tl.constexpr,  # 슬롯당 바이트
+    ROWB: tl.constexpr,     # 슬롯당 바이트
     BLOCK: tl.constexpr,
+    MAXROWS: tl.constexpr,  # 세그먼트 최대 행 수 (2의 거듭제곱)
 ):
     layer = tl.program_id(0)
     seg = tl.program_id(1)
@@ -60,14 +70,18 @@ def _compact_kernel(
     hi = tl.load(seg_start_ptr + seg + 1)
 
     offs = fblk * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < ROWB
+    cmask = offs < ROWB
+    rows = lo + tl.arange(0, MAXROWS)
+    rmask = rows < hi
 
-    # 🔴 반드시 증가 순서 (위 경쟁 조건 주석)
-    for i in range(lo, hi):
-        s = tl.load(src_ptr + i).to(tl.int64)
-        d = tl.load(dst_ptr + i).to(tl.int64)
-        v = tl.load(ptr + s * ROWB + offs, mask=mask)
-        tl.store(ptr + d * ROWB + offs, v, mask=mask)
+    s = tl.load(src_ptr + rows, mask=rmask, other=0).to(tl.int64)
+    d = tl.load(dst_ptr + rows, mask=rmask, other=0).to(tl.int64)
+
+    # 🔴 읽기가 전부 끝난 뒤에 쓴다. v 에 대한 데이터 의존이라 컴파일러가 store 를
+    #    load 앞으로 못 옮긴다 — 순서 전제 없이 gather 의미가 그대로 나온다.
+    m = rmask[:, None] & cmask[None, :]
+    v = tl.load(ptr + s[:, None] * ROWB + offs[None, :], mask=m)
+    tl.store(ptr + d[:, None] * ROWB + offs[None, :], v, mask=m)
 
 
 def attention_caches(caches, block_size: int):
@@ -89,18 +103,27 @@ def attention_caches(caches, block_size: int):
     return out
 
 
-def compact_kv_triton(caches, src_slots, dst_slots, seg_start, block_size: int) -> None:
+# 한 프로그램이 레지스터에 드는 타일 크기(바이트). MAXROWS x BLOCK 이 여기에
+# 맞도록 BLOCK 을 줄이고, 모자란 만큼은 fblk 축 병렬로 돌린다.
+_TILE_BYTES = int(os.environ.get("VLLM_DDTREE_COMPACT_TILE", "4096"))
+
+
+def compact_kv_triton(caches, src_slots, dst_slots, seg_start, block_size: int,
+                      max_seg_rows: int) -> None:
+    """max_seg_rows: 세그먼트 하나의 최대 행 수. 호출부가 CPU 에 이미 갖고 있는
+    값이라 공짜다 — 이걸 몰라서 GPU 에 물어보면 다시 동기화가 된다."""
     caches = attention_caches(caches, block_size)
     if not caches:
         return
     rowb = row_bytes(caches[0], block_size)
-    block = triton.next_power_of_2(min(rowb, 2048))
+    maxrows = triton.next_power_of_2(max(1, int(max_seg_rows)))
+    block = triton.next_power_of_2(min(rowb, max(64, _TILE_BYTES // maxrows)))
     ptrs = torch.tensor([c.data_ptr() for c in caches],
                         dtype=torch.int64, device=caches[0].device)
     grid = (len(caches), seg_start.numel() - 1, triton.cdiv(rowb, block))
     _compact_kernel[grid](
         ptrs, src_slots.to(torch.int32), dst_slots.to(torch.int32),
-        seg_start.to(torch.int32), ROWB=rowb, BLOCK=block,
+        seg_start.to(torch.int32), ROWB=rowb, BLOCK=block, MAXROWS=maxrows,
     )
 
 
